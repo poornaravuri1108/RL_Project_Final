@@ -1,0 +1,11 @@
+gymnasium[atari,accept-rom-license]==0.29.1
+torch>=2.2.0
+tensorflow-datasets>=4.9.0
+d3rlpy>=2.1.0          
+stable-baselines3>=2.3.2
+numpy 
+pandas 
+tqdm 
+matplotlib 
+seaborn 
+opencv-python
