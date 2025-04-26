@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 """
 1. Downloads RL-Unplugged Pong trace
 2. Converts to NumPy arrays
@@ -34,7 +33,7 @@ def build_dataset(config="Pong_run_5", limit=None, out="pong_offline.h5"):
         episode_terminals = np.array(dones, dtype=bool),
     )
     mdp.dump(out)
-    print(f"✅ Saved {len(mdp)} transitions → {out}")
+    print(f"Saved {len(mdp)} transitions → {out}")
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()

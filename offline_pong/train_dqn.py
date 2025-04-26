@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 """
 Offline value-based baseline using d3rlpy’s DQNConfig (Nature CNN).
 """

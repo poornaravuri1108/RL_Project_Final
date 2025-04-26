@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 """
 Batch-mode PPO on fixed trajectories (no env interaction).
 Caveat: performance is usually weaker than DQN in pure offline settings.

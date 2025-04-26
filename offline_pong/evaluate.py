@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 import argparse, gymnasium as gym, torch, numpy as np
 from d3rlpy.algos import DQN
 from collections import deque
