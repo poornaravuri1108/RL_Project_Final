@@ -38,14 +38,14 @@ class DQNNetwork(nn.Module):
             nn.Conv2d(64, 64, 3, stride=1),         nn.ReLU(),
             nn.Flatten()
         )
-        # find conv output dim
         with torch.no_grad():
-            d = self.conv(torch.zeros(1, in_channels, 84, 84)).shape[1]
+            dummy = torch.zeros(1, in_channels, 84, 84)
+            conv_out = self.conv(dummy).shape[1]
         self.value_stream = nn.Sequential(
-            nn.Linear(d, 512), nn.ReLU(), nn.Linear(512, 1)
+            nn.Linear(conv_out, 512), nn.ReLU(), nn.Linear(512, 1)
         )
         self.adv_stream = nn.Sequential(
-            nn.Linear(d, 512), nn.ReLU(), nn.Linear(512, n_actions)
+            nn.Linear(conv_out, 512), nn.ReLU(), nn.Linear(512, n_actions)
         )
 
     def forward(self, x):
@@ -57,36 +57,36 @@ class DQNNetwork(nn.Module):
 
 
 def train(dataset_path, steps, batch_size, device, seed):
-    # set up logging
+    # Setup logging
     logging.basicConfig(
-        format="%(asctime)s %(levelname)s: %(message)s",
-        level=logging.INFO
+        format="%(asctime)s %(levelname)s: %(message)s", level=logging.INFO
     )
-    logging.info(f"Training DQN — dataset: {dataset_path}, steps: {steps}, batch: {batch_size}, device: {device}")
+    logging.info(f"Starting DQN training: dataset={dataset_path}, steps={steps}, batch={batch_size}, device={device}")
 
-    # reproducibility
+    # Reproducibility
     np.random.seed(seed)
     torch.manual_seed(seed)
 
-    # build evaluation env
+    # Build evaluation environment
     eval_env = gym.make("ALE/Pong-v5", frameskip=1, obs_type="grayscale")
-    eval_env = gym.wrappers.AtariPreprocessing(
-        eval_env, frame_skip=4, grayscale_obs=True, screen_size=84, scale_obs=False
-    )
+    eval_env = gym.wrappers.AtariPreprocessing(eval_env, frame_skip=4,
+                                                grayscale_obs=True,
+                                                screen_size=84,
+                                                scale_obs=False)
     eval_env = gym.wrappers.FrameStack(eval_env, 4)
     n_actions = eval_env.action_space.n
     logging.info(f"Eval env ready — n_actions={n_actions}")
 
-    # load HDF5 dataset
+    # Open HDF5 dataset
     h5 = h5py.File(dataset_path, "r")
-    obs_ds    = h5["observations"]  # shape (N,4,84,84) or (N,84,84,4)
+    obs_ds    = h5["observations"]
     act_ds    = h5["actions"]
     rew_ds    = h5["rewards"]
     term_ds   = h5["terminals"]
     N = len(obs_ds)
     logging.info(f"Loaded dataset with {N} transitions")
 
-    # detect channel layout
+    # Infer channel layout
     sample = obs_ds[0]
     if sample.ndim == 3 and sample.shape[0] in [1,4]:
         in_ch = sample.shape[0]
@@ -96,110 +96,112 @@ def train(dataset_path, steps, batch_size, device, seed):
         in_ch = 1
     logging.info(f"Inferred in_channels={in_ch}")
 
-    # build networks
+    # Build models
     dev = torch.device(device)
     policy_net = DQNNetwork(in_ch, n_actions).to(dev)
     target_net = DQNNetwork(in_ch, n_actions).to(dev)
     target_net.load_state_dict(policy_net.state_dict())
     target_net.eval()
-
     optimizer = torch.optim.Adam(policy_net.parameters(), lr=1e-4)
+
     gamma = 0.99
     target_update_freq = 8000
 
-    # training metrics
+    # Prepare logging of eval metrics
     logs = [("step", "eval/average_reward")]
-    t0 = time.time()
+    t_start = time.time()
 
-    # main loop with tqdm
+    # Main training loop
     pbar = tqdm(range(1, steps+1), desc="DQN Training", ncols=100)
     for step in pbar:
-        # sample a minibatch of indices (avoiding last index)
-        idx = np.random.randint(0, N-1, size=batch_size)
-        obs_np = obs_ds[idx]           # (B,4,84,84) or (B,84,84,4)
-        nxt_np = obs_ds[idx+1]
-        acts   = act_ds[idx]
-        rews   = rew_ds[idx]
-        dones  = term_ds[idx]
+        # Sample random indices for the minibatch (avoid N-1 for next state)
+        idxs = np.random.randint(0, N-1, size=batch_size)
+        # Load minibatch one by one and stack
+        obs_batch = np.stack([
+            np.transpose(obs_ds[i], (2,0,1)) if obs_ds[i].ndim==3 and obs_ds[i].shape[-1] in [1,4]
+            else obs_ds[i]
+            for i in idxs
+        ], axis=0)  # shape (B,C,84,84)
+        nxt_batch = np.stack([
+            np.transpose(obs_ds[i+1], (2,0,1)) if obs_ds[i+1].ndim==3 and obs_ds[i+1].shape[-1] in [1,4]
+            else obs_ds[i+1]
+            for i in idxs
+        ], axis=0)
+        acts  = np.array([act_ds[i] for i in idxs], dtype=np.int64)
+        rews  = np.array([rew_ds[i] for i in idxs], dtype=np.float32)
+        dones = np.array([term_ds[i] for i in idxs], dtype=np.float32)
 
-        # permute channel-last -> channel-first if needed
-        if obs_np.ndim == 4 and obs_np.shape[-1] in [1,4]:
-            obs_np = np.transpose(obs_np, (0,3,1,2))
-            nxt_np = np.transpose(nxt_np, (0,3,1,2))
+        # Convert to tensors
+        obs_t  = torch.tensor(obs_batch, dtype=torch.float32, device=dev)
+        nxt_t  = torch.tensor(nxt_batch, dtype=torch.float32, device=dev)
+        acts_t = torch.tensor(acts, dtype=torch.long, device=dev)
+        rews_t = torch.tensor(rews, dtype=torch.float32, device=dev)
+        done_t = torch.tensor(dones, dtype=torch.float32, device=dev)
 
-        # convert to tensors
-        obs_t = torch.tensor(obs_np, dtype=torch.float32, device=dev)
-        nxt_t = torch.tensor(nxt_np, dtype=torch.float32, device=dev)
-        acts_t= torch.tensor(acts,   dtype=torch.long,    device=dev)
-        rews_t= torch.tensor(rews,   dtype=torch.float32, device=dev)
-        dones_t= torch.tensor(dones, dtype=torch.float32, device=dev)
-
-        # Q(s,a)
-        q_vals = policy_net(obs_t)                     # (B,A)
+        # Current Q(s,a)
+        q_vals = policy_net(obs_t)
         q_sa   = q_vals.gather(1, acts_t.unsqueeze(1)).squeeze(1)
 
-        # Double DQN target: select with policy_net, evaluate with target_net
+        # Compute Q_next via Double DQN
         with torch.no_grad():
-            q_pol_next = policy_net(nxt_t)
-            a_pol_next = q_pol_next.argmax(dim=1, keepdim=True)
-            q_tgt_next = target_net(nxt_t).gather(1, a_pol_next).squeeze(1)
-            target = rews_t + gamma * q_tgt_next * (1.0 - dones_t)
+            q_next_policy = policy_net(nxt_t)
+            next_actions  = q_next_policy.argmax(dim=1, keepdim=True)
+            q_next_target = target_net(nxt_t).gather(1, next_actions).squeeze(1)
+            q_target      = rews_t + gamma * q_next_target * (1 - done_t)
 
-        # loss and update
-        loss = F.smooth_l1_loss(q_sa, target)
+        # Loss and optimization
+        loss = F.smooth_l1_loss(q_sa, q_target)
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
 
-        # target network sync
+        # Periodic target network sync
         if step % target_update_freq == 0:
             target_net.load_state_dict(policy_net.state_dict())
-            logging.info(f"Step {step}: target network synced")
+            logging.info(f"[Step {step}] Target network synced")
 
-        # measure performance & GPU mem
-        elapsed = time.time() - t0
+        # Compute throughput & GPU mem
+        elapsed = time.time() - t_start
         fps = step / elapsed
-        if dev.type == 'cuda':
-            mem_alloc = torch.cuda.memory_allocated(dev) / 1e9
-            mem_reserved = torch.cuda.memory_reserved(dev) / 1e9
-        else:
-            mem_alloc = mem_reserved = 0.0
-
+        gpu_mem = ""
+        if dev.type == "cuda":
+            alloc = torch.cuda.memory_allocated(dev) / 1e9
+            resv  = torch.cuda.memory_reserved(dev) / 1e9
+            gpu_mem = f", GPU mem {alloc:.2f}G/{resv:.2f}G"
         pbar.set_postfix({
             "loss": f"{loss.item():.3f}",
-            "fps":  f"{fps:.1f}",
-            "gpu_mem": f"{mem_alloc:.2f}G/{mem_reserved:.2f}G"
+            "fps":  f"{fps:.1f}{gpu_mem}"
         })
 
-        # evaluation every 100k steps
+        # Periodic evaluation
         if step % 100_000 == 0 or step == steps:
-            total = 0.0
+            total_r = 0.0
             trials = 5
             for _ in range(trials):
                 o, _ = eval_env.reset()
                 done_e = False
-                score = 0.0
+                ep_r = 0.0
                 while not done_e:
                     o_np = np.array(o)
                     if o_np.ndim==3 and o_np.shape[-1] in [1,4]:
                         o_np = np.transpose(o_np,(2,0,1))
-                    o_tsn = torch.tensor(o_np, dtype=torch.float32, device=dev).unsqueeze(0)
+                    o_t = torch.tensor(o_np, dtype=torch.float32, device=dev).unsqueeze(0)
                     with torch.no_grad():
-                        qs = policy_net(o_tsn)
+                        qs = policy_net(o_t)
                         a  = int(qs.argmax(dim=1).item())
                     o, r, done_e, _, _ = eval_env.step(a)
-                    score += r
-                total += score
-            avg = total / trials
-            logging.info(f"Step {step}: eval avg return = {avg:.2f}")
-            logs.append((step, avg))
+                    ep_r += r
+                total_r += ep_r
+            avg_r = total_r / trials
+            logging.info(f"[Step {step}] Eval avg return = {avg_r:.2f}")
+            logs.append((step, avg_r))
 
-    # save model + logs
+    # Save model & logs
     torch.save(policy_net.state_dict(), "dqn_pong.pt")
     with open("dqn_logs.csv","w") as f:
         f.write("step,eval/average_reward\n")
-        for s,v in logs[1:]:
-            f.write(f"{s},{v:.2f}\n")
+        for s, val in logs[1:]:
+            f.write(f"{s},{val:.2f}\n")
 
     h5.close()
     logging.info("Training complete. Model and logs saved.")
