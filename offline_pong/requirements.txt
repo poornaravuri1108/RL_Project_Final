@@ -1,14 +1,23 @@
-# RL + dataset stack
-stable-baselines3[extra]==2.6.0          
-rl-zoo3==2.6.0
-d3rlpy==2.6.2                            
-gymnasium[atari,accept-rom-license]==1.0.0
-ale-py==0.8.1
-huggingface-hub==0.23.0
-huggingface_sb3==2.0.0
-tensorflow-datasets==4.9.4
-numpy==1.26.4
-pandas==2.2.2
-tqdm==4.66.4
-matplotlib==3.9.0
-seaborn==0.13.2
+# Core RL libraries
+torch>=2.0.0          # PyTorch (CPU-only on Mac)
+stable-baselines3>=2.0.0
+d3rlpy>=2.0.0
+
+# Hugging Face integration for SB3 (model hub)
+huggingface-sb3>=3.0
+huggingface-hub>=0.16.4
+
+# Gymnasium with Atari support (Pong environment)
+gymnasium[atari,accept-rom-license]==0.29.1
+
+# Dataset and data processing
+tensorflow-datasets==4.9.2
+tqdm>=4.64.0
+
+# Evaluation and plotting
+pandas>=1.3.0
+matplotlib>=3.5.0
+seaborn>=0.11.2
+
+# Basic dependencies
+numpy>=1.21.0
