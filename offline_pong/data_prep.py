@@ -12,7 +12,7 @@ def preprocess(obs):
     return (obs.astype(np.float32) / 255.0).squeeze(-1)
 
 def build_dataset(config="Pong_run_5", limit=None, out="pong_offline.h5"):
-    builder = tfds.builder("rlu_atari", config=config)
+    builder = tfds.builder("dqn_replay_atari", config="Pong")
     builder.download_and_prepare()
     ds = builder.as_dataset(split="train", shuffle_files=True)
 
