@@ -13,6 +13,8 @@
 echo "Job ID: $SLURM_JOB_ID"
 echo "Host: $(hostname)"
 nvidia-smi
+export http_proxy=http://172.16.1.2:3128
+export https_proxy=http://172.16.1.2:3128
 
 # Go to the directory where you ran sbatch
 cd $SLURM_SUBMIT_DIR
