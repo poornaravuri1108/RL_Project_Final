@@ -1,0 +1,8 @@
+A.L.E: Arcade Learning Environment (version 0.8.1+53f58b7)
+[Powered by Stella]
+/fs/atipa/home/017510883/RL_Pong_Project/RL_Project_Final/.venv/lib64/python3.9/site-packages/networkx/utils/backends.py:135: RuntimeWarning: networkx backend defined more than once: nx-loopback
+  backends.update(_get_backends("networkx.backends"))
+/fs/atipa/home/017510883/RL_Pong_Project/RL_Project_Final/offline_pong/train_offline_ppo.py:86: FutureWarning: `torch.cuda.amp.GradScaler(args...)` is deprecated. Please use `torch.amp.GradScaler('cuda', args...)` instead.
+  scaler = torch.cuda.amp.GradScaler() if device.type == 'cuda' else None
+/fs/atipa/home/017510883/RL_Pong_Project/RL_Project_Final/offline_pong/train_offline_ppo.py:150: FutureWarning: `torch.cuda.amp.autocast(args...)` is deprecated. Please use `torch.amp.autocast('cuda', args...)` instead.
+  with torch.cuda.amp.autocast(enabled=(scaler is not None)):
