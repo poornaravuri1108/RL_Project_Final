@@ -1,110 +1,165 @@
 """
-Improved Offline-PPO on Pong:
+Improved Offline PPO on Pong:
   - Behavior cloning warm-start (2 epochs)
-  - Logit clamping for numerical stability
+  - Logit clamping & NaN safety for numerical stability
   - Gradient clipping (max_norm=0.5)
-  - Reduced LR to 1e-5
+  - Reduced learning rate (1e-5)
 """
 import argparse
 import numpy as np
 import torch
 from torch import nn
+from torch.utils.data import DataLoader, TensorDataset
 import h5py
 import gymnasium as gym
-from torch.utils.data import DataLoader, TensorDataset
 
-# same CNNBackbone and ActorCritic definitions as before…
+# --- shared convolutional backbone (Nature CNN) ---
+class CNNBackbone(nn.Sequential):
+    def __init__(self, in_channels: int = 1):
+        super().__init__(
+            nn.Conv2d(in_channels, 32, kernel_size=8, stride=4), nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=4, stride=2),           nn.ReLU(),
+            nn.Conv2d(64, 64, kernel_size=3, stride=1),           nn.ReLU(),
+            nn.Flatten()
+        )
+        # compute output dimension
+        with torch.no_grad():
+            dummy = torch.zeros(1, in_channels, 84, 84)
+            conv_out = self.forward(dummy)
+        self.output_dim = conv_out.shape[1]
 
-def behavior_cloning(net, loader, optimizer, device, bc_epochs=2):
+# --- ActorCritic network with two heads ---
+class ActorCritic(nn.Module):
+    def __init__(self, in_channels: int, n_actions: int):
+        super().__init__()
+        self.body = CNNBackbone(in_channels)
+        self.policy_head = nn.Sequential(
+            nn.Linear(self.body.output_dim, 512), nn.ReLU(),
+            nn.Linear(512, n_actions)
+        )
+        self.value_head = nn.Sequential(
+            nn.Linear(self.body.output_dim, 512), nn.ReLU(),
+            nn.Linear(512, 1)
+        )
+
+    def forward(self, x: torch.Tensor):
+        # normalize pixel inputs
+        x = x / 255.0
+        z = self.body(x)
+        logits = self.policy_head(z)             # (batch, n_actions)
+        value  = self.value_head(z).squeeze(-1)  # (batch,)
+        return logits, value
+
+# --- compute discounted returns for an episode ---
+def compute_returns(rewards: torch.Tensor, gamma: float = 0.99) -> torch.Tensor:
+    returns = torch.zeros_like(rewards)
+    G = 0.0
+    for t in reversed(range(len(rewards))):
+        G = rewards[t] + gamma * G
+        returns[t] = G
+    return returns
+
+# --- simple behavior cloning warm-start on the offline buffer ---
+def behavior_cloning(net, loader, optimizer, device, bc_epochs: int = 2):
     net.train()
     for _ in range(bc_epochs):
-        for obs, act in loader:
-            obs, act = obs.to(device), act.to(device)
+        for obs_batch, act_batch in loader:
+            obs = obs_batch.to(device)
+            acts = act_batch.to(device)
             logits, _ = net(obs)
             # clamp & nan-safe
-            logits = logits.clamp(-10,10)
+            logits = logits.clamp(-10, 10)
             logits = torch.nan_to_num(logits, nan=0.0, posinf=10.0, neginf=-10.0)
-            bc_loss = -torch.distributions.Categorical(logits=logits).log_prob(act).mean()
+            bc_loss = -torch.distributions.Categorical(logits=logits).log_prob(acts).mean()
             optimizer.zero_grad()
             bc_loss.backward()
             nn.utils.clip_grad_norm_(net.parameters(), max_norm=0.5)
             optimizer.step()
 
-# compute_returns() unchanged …
-
-def train(dataset_path, epochs, device, clip=0.2, lr=1e-5,
-          mb_size=128, update_epochs=2, seed=42):
+# --- main training function ---
+def train(dataset_path: str,
+          epochs: int,
+          device: str,
+          clip: float = 0.2,
+          lr: float = 1e-5,
+          mb_size: int = 128,
+          update_epochs: int = 2,
+          seed: int = 42):
     torch.manual_seed(seed)
     device = torch.device(device)
 
-    # build eval env
+    # build evaluation environment
     env = gym.make("ALE/Pong-v5", frameskip=1, obs_type="grayscale")
-    env = gym.wrappers.AtariPreprocessing(env, frame_skip=4,
-           grayscale_obs=True, screen_size=84, scale_obs=False)
+    env = gym.wrappers.AtariPreprocessing(
+        env, frame_skip=4, grayscale_obs=True,
+        screen_size=84, scale_obs=False
+    )
     env = gym.wrappers.FrameStack(env, 4)
     n_actions = env.action_space.n
 
-    # load entire dataset once
+    # load entire offline dataset
     with h5py.File(dataset_path, "r") as h5:
         obs = np.array(h5["observations"])
-        acts= np.array(h5["actions"])
-        rews= np.array(h5["rewards"])
-        terms = np.array(h5["terminals"])
+        acts = np.array(h5["actions"])
+        rews = np.array(h5["rewards"])
+        terms= np.array(h5["terminals"])
 
-    # preprocess obs into (N, C, 84,84) and TensorDataset
-    if obs.ndim==4 and obs.shape[-1] in [1,4]:
-        obs = obs.transpose(0,3,1,2)
-    elif obs.ndim==3:
-        obs = obs[:,None,:,:]
-    obs_t = torch.tensor(obs, dtype=torch.float32)/255.0
-    act_t = torch.tensor(acts, dtype=torch.long)
-    ds = TensorDataset(obs_t, act_t)
-    bc_loader = DataLoader(ds, batch_size=256, shuffle=True)
+    # preprocess observations → (N, C, 84, 84)
+    if obs.ndim == 4 and obs.shape[-1] in [1, 4]:
+        obs = obs.transpose(0, 3, 1, 2)
+    elif obs.ndim == 3:
+        obs = obs[:, None, :, :]
+    obs_t = torch.tensor(obs, dtype=torch.float32, device=device)
+    act_t = torch.tensor(acts, dtype=torch.long, device=device)
+    rew_t = torch.tensor(rews, dtype=torch.float32, device=device)
 
-    # model
+    # behavior cloning data loader
+    bc_ds = TensorDataset(obs_t, act_t)
+    bc_loader = DataLoader(bc_ds, batch_size=256, shuffle=True)
+
+    # initialize network & optimizer
     net = ActorCritic(obs_t.shape[1], n_actions).to(device)
     optimizer = torch.optim.Adam(net.parameters(), lr=lr)
 
-    # Behavior cloning warm start
+    # warm-start via behavior cloning
     behavior_cloning(net, bc_loader, optimizer, device, bc_epochs=2)
 
-    # now offline PPO
-    for epoch in range(1, epochs+1):
-        # compute old log-probs & advantages for entire buffer
-        with torch.no_grad():
-            logits_all, vals_all = net(obs_t.to(device))
-            # clamp & nan-safe
-            logits_all = logits_all.clamp(-10,10)
-            logits_all = torch.nan_to_num(logits_all, nan=0.0, posinf=10.0, neginf=-10.0)
-            dist = torch.distributions.Categorical(logits=logits_all)
-            old_logp = dist.log_prob(act_t.to(device))
-            returns = compute_returns(torch.tensor(rews, dtype=torch.float32), 0.99).to(device)
-            adv = (returns - vals_all).cpu()
-            adv = (adv - adv.mean())/(adv.std()+1e-8)
+    # precompute old_logp & advantages over entire buffer
+    with torch.no_grad():
+        logits_all, vals_all = net(obs_t)
+        logits_all = logits_all.clamp(-10, 10)
+        logits_all = torch.nan_to_num(logits_all, nan=0.0, posinf=10.0, neginf=-10.0)
+        dist_all = torch.distributions.Categorical(logits=logits_all)
+        old_logp = dist_all.log_prob(act_t)
 
-        # mini-batch updates
+        returns_all = compute_returns(rew_t, gamma=0.99)
+        advantages = returns_all - vals_all
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+    # offline PPO updates
+    for epoch in range(1, epochs + 1):
+        perm = torch.randperm(len(obs_t), device=device)
         for _ in range(update_epochs):
-            perm = torch.randperm(len(obs_t))
-            for start in range(0, len(obs_t), mb_size):
-                idx_mb = perm[start:start+mb_size]
-                mb_obs = obs_t[idx_mb].to(device)
-                mb_act = act_t[idx_mb].to(device)
-                mb_old = old_logp[idx_mb]
-                mb_adv = adv[idx_mb].to(device)
-                mb_ret = returns[idx_mb]
+            for i in range(0, len(obs_t), mb_size):
+                idx = perm[i : i + mb_size]
+                mb_obs = obs_t[idx]
+                mb_act = act_t[idx]
+                mb_old = old_logp[idx]
+                mb_adv = advantages[idx]
+                mb_ret = returns_all[idx]
 
                 logits, vals = net(mb_obs)
-                logits = logits.clamp(-10,10)
+                logits = logits.clamp(-10, 10)
                 logits = torch.nan_to_num(logits, nan=0.0, posinf=10.0, neginf=-10.0)
                 dist = torch.distributions.Categorical(logits=logits)
                 new_logp = dist.log_prob(mb_act)
 
                 ratio = (new_logp - mb_old).exp()
-                s1 = ratio * mb_adv
-                s2 = torch.clamp(ratio, 1-clip, 1+clip)*mb_adv
-                policy_loss = -torch.min(s1,s2).mean()
-                value_loss  = 0.5*(mb_ret - vals).pow(2).mean()
-                entropy_loss= -0.01*dist.entropy().mean()
+                surr1 = ratio * mb_adv
+                surr2 = torch.clamp(ratio, 1 - clip, 1 + clip) * mb_adv
+                policy_loss = -torch.min(surr1, surr2).mean()
+                value_loss  = 0.5 * (mb_ret - vals).pow(2).mean()
+                entropy_loss= -0.01 * dist.entropy().mean()
                 loss = policy_loss + value_loss + entropy_loss
 
                 optimizer.zero_grad()
@@ -112,35 +167,43 @@ def train(dataset_path, epochs, device, clip=0.2, lr=1e-5,
                 nn.utils.clip_grad_norm_(net.parameters(), max_norm=0.5)
                 optimizer.step()
 
-        # evaluate
+        # evaluation after each epoch
         net.eval()
-        total_r = 0.0
+        total_reward = 0.0
         for _ in range(10):
-            o, _ = env.reset()
-            done=False; ep_r=0.0
+            obs_e, _ = env.reset()
+            done = False
+            ep_reward = 0.0
             while not done:
-                t = torch.tensor(o, dtype=torch.float32, device=device).unsqueeze(0)/255.0
-                if t.ndim==3: t=t.unsqueeze(0)
+                obs_tensor = torch.tensor(obs_e, dtype=torch.float32, device=device).unsqueeze(0) / 255.0
+                if obs_tensor.ndim == 3:
+                    obs_tensor = obs_tensor.unsqueeze(0)
                 with torch.no_grad():
-                    logit,_ = net(t)
-                    act = int(logit.argmax(dim=1).item())
-                o, r, done, _, _ = env.step(act)
-                ep_r+=r
-            total_r+=ep_r
-        avg_r = total_r/10
-        print(f"Epoch {epoch}: Avg Return = {avg_r:.2f}")
+                    logits, _ = net(obs_tensor)
+                    action = int(logits.argmax(dim=-1).item())
+                obs_e, r, done, _, _ = env.step(action)
+                ep_reward += r
+            total_reward += ep_reward
+        avg_return = total_reward / 10
+        print(f"Epoch {epoch}: Avg Return = {avg_return:.2f}")
         net.train()
 
+    # save final policy
     torch.save(net.state_dict(), "ppo_offline_improved.pt")
 
-if __name__=="__main__":
-    p = argparse.ArgumentParser()
-    p.add_argument("--dataset", default="pong_offline.h5")
-    p.add_argument("--epochs",  type=int, default=10)
-    p.add_argument("--device",  default="cuda" if torch.cuda.is_available() else "cpu")
-    p.add_argument("--seed",    type=int, default=42)
-    args = p.parse_args()
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dataset", default="pong_offline.h5",
+                        help="Path to the offline HDF5 dataset")
+    parser.add_argument("--epochs",  type=int, default=10,
+                        help="Number of PPO training epochs")
+    parser.add_argument("--device",  default="cuda" if torch.cuda.is_available() else "cpu",
+                        help="Device to train on")
+    parser.add_argument("--seed",    type=int, default=42,
+                        help="Random seed for reproducibility")
+    args = parser.parse_args()
     train(args.dataset, args.epochs, args.device, seed=args.seed)
+
 
 
 # import argparse
