@@ -1,28 +1,30 @@
 #!/bin/bash
-#SBATCH --job-name=dqn_pong             # your job name
-#SBATCH --output=slurm-%j.out           # STDOUT → slurm-<jobid>.out
-#SBATCH --error=slurm-%j.err            # STDERR → slurm-<jobid>.err
-#SBATCH --mail-type=BEGIN,END,FAIL      # email notifications
+#SBATCH --job-name=ppo_pong
+#SBATCH --output=slurm-%j.out
+#SBATCH --error=slurm-%j.err
+#SBATCH --mail-type=BEGIN,END,FAIL
 #SBATCH --mail-user=poorna.ravuri@sjsu.edu
-#SBATCH --partition=mgpuq               # medium-GPU queue
-#SBATCH --ntasks=1                      # one process
-#SBATCH --cpus-per-task=10              # CPU cores
-#SBATCH --mem=64G                       # RAM
-#SBATCH --time=12:00:00                 # walltime hh:mm:ss
+
+#SBATCH --partition=lgpuq
+#SBATCH --nodelist=g[16-19]
+##SBATCH --exclusive
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=10
+#SBATCH --mem=64G
+#SBATCH --time=12:00:00
 
 echo "Job ID: $SLURM_JOB_ID"
 echo "Host: $(hostname)"
 nvidia-smi
+
 export http_proxy=http://172.16.1.2:3128
 export https_proxy=http://172.16.1.2:3128
+#export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-# Go to the directory where you ran sbatch
 cd $SLURM_SUBMIT_DIR
-
-# Activate your virtualenv (located at repo root/.venv)
 source .venv/bin/activate
 
-echo "Installing dependencies into .venv…"
+echo "Installing dependencies…"
 pip install --upgrade pip --no-cache-dir
 pip install -r offline_pong/requirements.txt --no-cache-dir
 
@@ -30,7 +32,6 @@ echo "Python: $(which python)"
 echo "CUDA_VISIBLE_DEVICES: $CUDA_VISIBLE_DEVICES"
 python --version
 
-# Move into your code directory
 cd offline_pong
 
 echo "Starting training at $(date)…"
