@@ -3,3 +3,6 @@ __pycache__/
 logs/
 tfds_cache/
 *.h5
+*.pt
+*.err
+*.out
