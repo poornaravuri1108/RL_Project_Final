@@ -1,182 +1,150 @@
+#!/usr/bin/env python3
 """
-Improved Offline DQN training on Pong:
-  - Gradient clipping (max_norm=10)
-  - Huber loss logging to CSV
-  - Tuned learning rate
+Robust offline‑DQN on Pong.
+  – safe channel detection / conversion
+  – gradient‑clipping
+  – periodic evaluation
 """
 import argparse, logging, time
 import numpy as np
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import h5py
-import gymnasium as gym
+import torch, torch.nn as nn, torch.nn.functional as F
+import h5py, gymnasium as gym
 from tqdm import tqdm
 
-class DQNNetwork(nn.Module):
-    def __init__(self, in_channels: int, n_actions: int):
+# ---------------------------------------------------------------------------
+class DQNNet(nn.Module):
+    def __init__(self, c_in: int, n_actions: int):
         super().__init__()
         self.conv = nn.Sequential(
-            nn.Conv2d(in_channels, 32, 8, stride=4), nn.ReLU(),
-            nn.Conv2d(32, 64, 4, stride=2),    nn.ReLU(),
-            nn.Conv2d(64, 64, 3, stride=1),    nn.ReLU(),
+            nn.Conv2d(c_in, 32, 8, stride=4), nn.ReLU(),
+            nn.Conv2d(32, 64, 4, stride=2),   nn.ReLU(),
+            nn.Conv2d(64, 64, 3, stride=1),   nn.ReLU(),
             nn.Flatten()
         )
-        # compute conv output size
         with torch.no_grad():
-            dummy = torch.zeros(1, in_channels, 84, 84)
-            conv_out = self.conv(dummy).shape[1]
-        self.value_stream = nn.Sequential(
-            nn.Linear(conv_out, 512), nn.ReLU(),
-            nn.Linear(512, 1)
-        )
-        self.adv_stream = nn.Sequential(
-            nn.Linear(conv_out, 512), nn.ReLU(),
-            nn.Linear(512, n_actions)
-        )
+            dummy = torch.zeros(1, c_in, 84, 84)
+            flat = self.conv(dummy).shape[1]
+        self.value = nn.Sequential(nn.Linear(flat, 512), nn.ReLU(), nn.Linear(512, 1))
+        self.adv   = nn.Sequential(nn.Linear(flat, 512), nn.ReLU(), nn.Linear(512, n_actions))
 
     def forward(self, x):
         x = x / 255.0
-        feat = self.conv(x)
-        val  = self.value_stream(feat)
-        adv  = self.adv_stream(feat)
-        return val + adv - adv.mean(dim=1, keepdim=True)
+        z = self.conv(x)
+        return self.value(z) + self.adv(z) - self.adv(z).mean(1, keepdim=True)
 
-def train(dataset_path, steps, batch_size, device, seed):
+# ---------------------------------------------------------------------------
+def to_chw(arr):
+    """Return (C,84,84) numpy array regardless of original layout."""
+    if arr.ndim == 2:                       # (H,W)
+        return arr[np.newaxis, ...]         # → (1,H,W)
+    if arr.shape[0] in {1,3,4}:             # already CHW
+        return arr
+    return np.transpose(arr, (2,0,1))       # HWC → CHW
+
+# ---------------------------------------------------------------------------
+def train(h5_path, steps, bs, device, seed):
     logging.basicConfig(format="%(asctime)s %(levelname)s: %(message)s",
                         level=logging.INFO)
-    logging.info(f"Starting DQN: data={dataset_path} steps={steps} batch={batch_size}")
-
-    np.random.seed(seed)
-    torch.manual_seed(seed)
+    np.random.seed(seed); torch.manual_seed(seed)
     dev = torch.device(device)
 
-    # build eval env
-    eval_env = gym.make("ALE/Pong-v5", frameskip=1, obs_type="grayscale")
-    eval_env = gym.wrappers.AtariPreprocessing(eval_env, frame_skip=4,
-        grayscale_obs=True, screen_size=84, scale_obs=False)
-    eval_env = gym.wrappers.FrameStack(eval_env, 4)
-    n_actions = eval_env.action_space.n
-
-    # load offline data
-    h5 = h5py.File(dataset_path, "r")
-    obs_ds  = h5["observations"]
-    act_ds  = h5["actions"]
-    rew_ds  = h5["rewards"]
-    term_ds = h5["terminals"]
+    # --- load dataset -------------------------------------------------------
+    h5 = h5py.File(h5_path, "r")
+    obs_ds, act_ds, rew_ds, term_ds = (h5[k] for k in
+                                       ("observations", "actions", "rewards", "terminals"))
     N = len(obs_ds)
     logging.info(f"Loaded {N} transitions")
 
-    # indices of ±1 rewards for oversampling
-    reward_idxs = np.where((rew_ds[:] != 0))[0]
+    # infer channel‑count AFTER conversion
+    in_ch = to_chw(obs_ds[0]).shape[0]
+    logging.info(f"Inferred input channels = {in_ch}")
 
-    # build networks
-    in_ch = obs_ds.shape[1] if obs_ds.ndim == 4 else obs_ds.shape[-1]
-    policy_net = DQNNetwork(in_ch, n_actions).to(dev)
-    target_net = DQNNetwork(in_ch, n_actions).to(dev)
-    target_net.load_state_dict(policy_net.state_dict())
-    target_net.eval()
-    optimizer = torch.optim.Adam(policy_net.parameters(), lr=5e-5)
+    # reward indices (for oversampling)
+    rew_idx = np.where(rew_ds[:] != 0)[0]
 
-    gamma = 0.99
-    target_update = 8000
+    # --- networks & optim ---------------------------------------------------
+    env = gym.make("ALE/Pong-v5", frameskip=1, obs_type="grayscale")
+    env = gym.wrappers.AtariPreprocessing(env, frame_skip=4, grayscale_obs=True,
+                                          screen_size=84, scale_obs=False)
+    env = gym.wrappers.FrameStack(env, 4)
+    n_actions = env.action_space.n
 
-    # prepare logs
-    logs = [("step", "eval/average_reward", "loss")]
-    t0 = time.time()
+    net = DQNNet(in_ch, n_actions).to(dev)
+    tgt = DQNNet(in_ch, n_actions).to(dev)
+    tgt.load_state_dict(net.state_dict())
+    optim = torch.optim.Adam(net.parameters(), lr=5e-5)
+    gamma, sync_every = 0.99, 8_000
 
-    pbar = tqdm(range(1, steps+1), desc="DQN Training", ncols=100)
-    for step in pbar:
-        # sample 75% uniform, 25% reward transitions
-        n_sp = max(1, batch_size // 4)
-        n_un = batch_size - n_sp
-        iu = np.random.randint(0, N-1, n_un)
-        pool = reward_idxs[reward_idxs < N-1]
-        is_ = np.random.choice(pool, n_sp, replace=len(pool)<n_sp)
-        idxs = np.concatenate([iu, is_])
-        np.random.shuffle(idxs)
+    # --- training loop ------------------------------------------------------
+    log, t0 = [], time.time()
+    for step in tqdm(range(1, steps+1), ncols=100, desc="DQN"):
+        # sample mini‑batch (¾ uniform + ¼ reward transitions)
+        n_sp = max(1, bs//4)
+        idx  = np.concatenate([
+            np.random.randint(0, N-1, bs-n_sp),
+            np.random.choice(rew_idx[rew_idx < N-1], n_sp, replace=len(rew_idx)<n_sp)
+        ])
+        np.random.shuffle(idx)
 
-        # build batch
-        obs_b = []
-        nxt_b = []
-        acts  = []
-        rews  = []
-        dones = []
-        for i in idxs:
-            o = obs_ds[i]
-            no= obs_ds[i+1]
-            obs_b.append(np.transpose(o, (2,0,1)) if o.ndim==3 else o)
-            nxt_b.append(np.transpose(no,(2,0,1)) if no.ndim==3 else no)
+        # build tensors ------------------------------------------------------
+        obs_b, nxt_b, acts, rews, dones = [], [], [], [], []
+        for i in idx:
+            o, n = obs_ds[i], obs_ds[i+1]
+            obs_b.append(to_chw(o)); nxt_b.append(to_chw(n))
             acts.append(int(act_ds[i]))
-            rews.append(float(rew_ds[i]))
-            dones.append(float(term_ds[i]))
-        obs_t = torch.tensor(np.array(obs_b), dtype=torch.float32, device=dev)
-        nxt_t = torch.tensor(np.array(nxt_b), dtype=torch.float32, device=dev)
-        acts_t = torch.tensor(acts, dtype=torch.long, device=dev)
-        rews_t = torch.tensor(rews, dtype=torch.float32, device=dev)
-        dones_t= torch.tensor(dones, dtype=torch.float32, device=dev)
+            rews.append(float(rew_ds[i])); dones.append(float(term_ds[i]))
+        obs_t = torch.tensor(obs_b, dtype=torch.float32, device=dev)
+        nxt_t = torch.tensor(nxt_b, dtype=torch.float32, device=dev)
+        act_t = torch.tensor(acts,  dtype=torch.long,  device=dev)
+        rew_t = torch.tensor(rews,  dtype=torch.float32, device=dev)
+        don_t = torch.tensor(dones, dtype=torch.float32, device=dev)
 
-        # compute Q
-        q_vals   = policy_net(obs_t)
-        q_sa     = q_vals.gather(1, acts_t.unsqueeze(1)).squeeze(1)
+        q_sa = net(obs_t).gather(1, act_t.unsqueeze(1)).squeeze(1)
         with torch.no_grad():
-            # Double DQN target
-            next_actions = policy_net(nxt_t).argmax(dim=1, keepdim=True)
-            q_next = target_net(nxt_t).gather(1, next_actions).squeeze(1)
-            q_tgt  = rews_t + gamma * q_next * (1 - dones_t)
+            na = net(nxt_t).argmax(1, keepdim=True)
+            tgt_q = tgt(nxt_t).gather(1, na).squeeze(1)
+            y = rew_t + gamma * tgt_q * (1-don_t)
 
-        loss = F.smooth_l1_loss(q_sa, q_tgt)
-        optimizer.zero_grad()
-        loss.backward()
-        # <<< gradient clipping >>>
-        nn.utils.clip_grad_norm_(policy_net.parameters(), max_norm=10)
-        optimizer.step()
+        loss = F.smooth_l1_loss(q_sa, y)
+        optim.zero_grad(); loss.backward()
+        nn.utils.clip_grad_norm_(net.parameters(), 10.0)
+        optim.step()
 
-        # sync target
-        if step % target_update == 0:
-            target_net.load_state_dict(policy_net.state_dict())
-            logging.info(f"[Step {step}] Target network synced")
+        if step % sync_every == 0:
+            tgt.load_state_dict(net.state_dict())
+            logging.info(f"[{step}] target sync")
 
-        # periodic eval
-        if step % 20000 == 0 or step==steps:
-            total_r = 0.0
+        if step % 20_000 == 0 or step == steps:
+            # quick eval ------------------------------------------------------
+            total = 0.0
             for _ in range(10):
-                obs, _ = eval_env.reset()
-                done = False
-                ep_r = 0.0
+                s, _ = env.reset(); ep = 0.0; done = False
                 while not done:
-                    st = torch.tensor(obs, dtype=torch.float32, device=dev).unsqueeze(0)
-                    with torch.no_grad():
-                        qv = policy_net(st)
-                        act = int(qv.argmax(dim=1).item())
-                    obs, reward, done, _, _ = eval_env.step(act)
-                    ep_r += reward
-                total_r += ep_r
-            avg_r = total_r / 10
-            logs.append((step, avg_r, loss.item()))
-            logging.info(f"[Step {step}] Eval avg return = {avg_r:.2f}, loss={loss.item():.4f}")
+                    s_t = torch.tensor(to_chw(s), dtype=torch.float32,
+                                       device=dev).unsqueeze(0)
+                    with torch.no_grad(): a = int(net(s_t).argmax(1))
+                    s, r, done, _, _ = env.step(a); ep += r
+                total += ep
+            avg = total / 10
+            log.append((step, avg, loss.item()))
+            logging.info(f"[{step}] avg return {avg:.2f} | loss {loss.item():.4f}")
 
-        # update progress bar
-        pbar.set_postfix({"loss": f"{loss.item():.3f}"})
+    torch.save(net.state_dict(), "dqn_pong.pt")
+    with open("dqn_logs.csv", "w") as f:
+        f.write("step,avg_return,loss\n")
+        for s, r, l in log: f.write(f"{s},{r:.2f},{l:.4f}\n")
+    h5.close(); logging.info("done")
 
-    # save
-    torch.save(policy_net.state_dict(), "dqn_pong.pt")
-    with open("dqn_logs.csv","w") as f:
-        f.write("step,eval/average_reward,loss\n")
-        for s,r,l in logs[1:]:
-            f.write(f"{s},{r:.2f},{l:.4f}\n")
-    h5.close()
-    logging.info("Training complete.")
-
+# ---------------------------------------------------------------------------
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
-    p.add_argument("--dataset",  default="pong_offline.h5")
-    p.add_argument("--steps",    type=int, default=500000)
-    p.add_argument("--batch-size",type=int,default=64)
-    p.add_argument("--device",   default="cuda" if torch.cuda.is_available() else "cpu")
-    p.add_argument("--seed",     type=int, default=42)
-    args = p.parse_args()
-    train(args.dataset, args.steps, args.batch_size, args.device, args.seed)
+    p.add_argument("--dataset", default="pong_offline.h5")
+    p.add_argument("--steps", type=int, default=500_000)
+    p.add_argument("--batch-size", type=int, default=64)
+    p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument("--seed", type=int, default=42)
+    train(**vars(p.parse_args()))
+
 
 
 # #!/usr/bin/env python3
