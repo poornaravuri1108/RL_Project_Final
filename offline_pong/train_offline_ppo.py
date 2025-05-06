@@ -136,12 +136,15 @@ def train(h5_path, epochs, device, seed=42, lr=1e-5,
 
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    p=argparse.ArgumentParser()
+    p = argparse.ArgumentParser()
     p.add_argument("--dataset", default="pong_offline.h5")
-    p.add_argument("--epochs", type=int, default=10)
-    p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    p.add_argument("--seed", type=int, default=42)
-    train(**vars(p.parse_args()))
+    p.add_argument("--epochs",  type=int, default=10)
+    p.add_argument("--device",  default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument("--seed",    type=int, default=42)
+    args = p.parse_args()
+
+    train(args.dataset, args.epochs, args.device, seed=args.seed)
+
 
 
 

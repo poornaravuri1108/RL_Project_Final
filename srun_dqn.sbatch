@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=ppo_pong
+#SBATCH --job-name=dqn_pong
 #SBATCH --output=slurm-%j.out
 #SBATCH --error=slurm-%j.err
 #SBATCH --mail-type=BEGIN,END,FAIL

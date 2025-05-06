@@ -135,15 +135,20 @@ def train(h5_path, steps, bs, device, seed):
         for s, r, l in log: f.write(f"{s},{r:.2f},{l:.4f}\n")
     h5.close(); logging.info("done")
 
-# ---------------------------------------------------------------------------
+
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
-    p.add_argument("--dataset", default="pong_offline.h5")
-    p.add_argument("--steps", type=int, default=500_000)
-    p.add_argument("--batch-size", type=int, default=64)
-    p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    p.add_argument("--seed", type=int, default=42)
-    train(**vars(p.parse_args()))
+    p.add_argument("--dataset",     default="pong_offline.h5")
+    p.add_argument("--steps",       type=int, default=500_000)
+    p.add_argument("--batch-size",  type=int, default=64)
+    p.add_argument("--device",      default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument("--seed",        type=int, default=42)
+    args = p.parse_args()
+
+    # explicit mapping to the train() signature
+    train(args.dataset, args.steps, args.batch_size,
+          args.device, args.seed)
+
 
 
 
