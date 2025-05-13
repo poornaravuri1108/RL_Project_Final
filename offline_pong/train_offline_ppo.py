@@ -48,7 +48,18 @@ class ActorCritic(nn.Module):
         return self.pi(x), self.v(x).squeeze(-1)
 
 
-# ─────────────────────── helper functions ───────────────────────
+# ───────────────────── Helper functions ─────────────────────
+def random_crop(x, padding=4):
+    """Apply random crop data augmentation to batch of observations."""
+    b, c, h, w = x.shape
+    padded = F.pad(x, (padding, padding, padding, padding), mode='constant', value=0)
+    crops = []
+    for i in range(b):
+        top = np.random.randint(0, padding * 2)
+        left = np.random.randint(0, padding * 2)
+        crops.append(padded[i:i+1, :, top:top+h, left:left+w])
+    return torch.cat(crops, dim=0)
+
 def to_chw(arr: np.ndarray) -> np.ndarray:
     """Convert NHWC/HWC/HW to NCHW/CHW."""
     if arr.ndim == 4:
@@ -147,9 +158,62 @@ def awbc_update(net, opt, obs, act, ret, adv,
 
 
 # ──────────────────── Original PPO minibatch update ────────────────────
+def weighted_bc_ppo_update(net, opt, obs, act, old_lp, ret, adv,
+                        clip, vf_coef, ent_coef, gd_epochs, mb_size,
+                        grad_clip, device, bc_coef=2.0, adv_weight=10.0):
+    """PPO with advantage-weighted BC regularization (inspired by TD3+BC)"""
+    dataset = TensorDataset(obs, act, old_lp, ret, adv)
+    loader = DataLoader(dataset, batch_size=mb_size, shuffle=True, drop_last=True)
+    
+    for _ in range(gd_epochs):
+        for o, a, olp, r, ad in loader:
+            o, a, olp, r, ad = [t.to(device) for t in (o, a, olp, r, ad)]
+            
+            # Apply data augmentation randomly
+            if np.random.random() < 0.3:
+                o = random_crop(o)
+            
+            # Forward pass
+            logits, v = net(o)
+            if not torch.isfinite(logits).all() or not torch.isfinite(v).all():
+                continue  # skip corrupt batch
+                
+            # Compute policy distribution
+            dist = torch.distributions.Categorical(logits=logits)
+            
+            # Compute TD3+BC style weighted behavior cloning
+            # This weights BC loss based on advantage - emphasizing high-advantage actions
+            normalized_adv = (ad - ad.mean()) / (ad.std() + 1e-8)  
+            weights = torch.exp(normalized_adv / adv_weight)
+            weights = torch.clamp(weights, 0.1, 10.0)  # Prevent extreme weights
+            weights = weights / weights.sum()
+            
+            # Compute weighted BC loss - prioritize high-advantage actions
+            bc_logprobs = F.log_softmax(logits, dim=1)
+            bc_selected_logprobs = bc_logprobs.gather(1, a.unsqueeze(1)).squeeze(1)
+            bc_loss = -(weights * bc_selected_logprobs).sum()
+            
+            # Value function loss - standard MSE
+            vf_loss = F.mse_loss(v, r)
+            
+            # Complete loss function
+            loss = vf_coef * vf_loss + bc_coef * bc_loss - ent_coef * dist.entropy().mean()
+            
+            # Skip if we encounter any NaNs
+            if torch.isnan(loss) or torch.isinf(loss):
+                continue
+            
+            # Optimization step
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(net.parameters(), grad_clip)
+            opt.step()
+
+
 def ppo_update(net, opt, obs, act, old_lp, ret, adv,
                clip, vf_coef, ent_coef, gd_epochs, mb_size,
                grad_clip, device, kl_coef=2.0, bc_coef=1.0):
+    """Standard PPO update with KL and BC regularization"""
     dataset = TensorDataset(obs, act, old_lp, ret, adv)
     loader = DataLoader(dataset, batch_size=mb_size, shuffle=True, drop_last=True)
     for _ in range(gd_epochs):
@@ -213,15 +277,17 @@ def main():
     pa = argparse.ArgumentParser()
     pa.add_argument('--dataset', required=True)
     pa.add_argument('--epochs', type=int, default=30)
-    pa.add_argument('--bc_epochs', type=int, default=15)  # Even more BC epochs
-    pa.add_argument('--batch_size', type=int, default=4096)
+    pa.add_argument('--bc_epochs', type=int, default=15)  # More BC epochs for better initialization
+    pa.add_argument('--batch_size', type=int, default=4096) 
     pa.add_argument('--ppo_mb', type=int, default=256)
-    pa.add_argument('--use_awbc', action='store_true', default=True,
-                    help='Use Advantage-Weighted Behavior Cloning instead of PPO')
-    pa.add_argument('--awbc_batches', type=int, default=100, 
-                    help='Number of AWBC updates per epoch')
-    pa.add_argument('--awbc_beta', type=float, default=0.05,
-                    help='Temperature parameter for advantage weighting')
+    pa.add_argument('--algorithm', type=str, choices=['ppo', 'awbc', 'weighted_bc_ppo'], default='weighted_bc_ppo',
+                    help='Algorithm to use: standard PPO, AWBC, or weighted BC-PPO (TD3+BC style)')
+    pa.add_argument('--weighted_bc_coef', type=float, default=2.0,
+                    help='Weight for behavior cloning term in weighted BC-PPO')
+    pa.add_argument('--adv_weight', type=float, default=10.0,
+                    help='Temperature for advantage weighting in weighted BC-PPO')
+    pa.add_argument('--awbc_batches', type=int, default=100,
+                    help='Number of updates per epoch for AWBC')
     pa.add_argument('--clip', type=float, default=0.1)  # Reduced clip parameter for more conservative updates
     pa.add_argument('--vf_coef', type=float, default=0.5)
     pa.add_argument('--ent_coef', type=float, default=0.001)  # Further reduced entropy for offline learning
@@ -294,8 +360,46 @@ def main():
         
         # ─── Training epochs ───
         for ep in range(1, args.epochs + 1):
-            # Choose training approach based on args
-            if args.use_awbc:
+            # Choose training approach based on algorithm selection
+            if args.algorithm == 'weighted_bc_ppo':
+                # --- Weighted BC-PPO (TD3+BC inspired approach) ---
+                print(f"Training with Weighted BC-PPO for epoch {ep}/{args.epochs}...")
+                
+                # Compute log-probs & values batch-wise (still needed for advantage estimation)
+                net.eval()
+                v_list = []
+                loader = DataLoader(TensorDataset(obs_t), batch_size=args.batch_size, shuffle=False)
+                
+                print(f"Computing values for epoch {ep}/{args.epochs}...")
+                with torch.no_grad():
+                    for o_b in tqdm(loader, desc="Computing values", ncols=80):
+                        o_device = o_b[0].to(device, non_blocking=True)
+                        _, v = net(o_device)
+                        v_list.append(v.cpu())
+                        torch.cuda.empty_cache() if device.type == 'cuda' else None
+                    
+                val_t = torch.cat(v_list)
+                
+                # Calculate advantages
+                adv_t = ret_t - val_t
+                adv_t = (adv_t - adv_t.mean()) / (adv_t.std() + 1e-8)
+                adv_t = torch.clamp(adv_t, -10.0, 10.0)  # Prevent extreme values
+                
+                # Dummy old log probs (not used in weighted_bc_ppo but needed for DataLoader)
+                old_lp = torch.zeros_like(act_t, dtype=torch.float32)
+                
+                # Run weighted BC-PPO updates
+                net.train()
+                weighted_bc_ppo_update(
+                    net, opt, obs_t, act_t, old_lp, ret_t, adv_t,
+                    clip=args.clip, vf_coef=args.vf_coef, ent_coef=args.ent_coef,
+                    gd_epochs=args.ppo_gd, mb_size=args.ppo_mb,
+                    grad_clip=args.grad_clip, device=device,
+                    bc_coef=args.weighted_bc_coef, adv_weight=args.adv_weight
+                )
+                mean_loss = 0.0  # Not explicitly tracked
+                
+            elif args.algorithm == 'awbc':
                 # --- Advantage-weighted behavior cloning ---
                 print(f"Training with AWBC for epoch {ep}/{args.epochs}...")
                 net.train()
@@ -321,7 +425,8 @@ def main():
                     epoch_losses.append(loss)
                 
                 mean_loss = np.mean(epoch_losses)
-            else:
+                
+            else:  # Standard PPO
                 # --- Standard PPO approach ---
                 net.eval()
                 olp_list, v_list = [], []
@@ -337,7 +442,7 @@ def main():
                         o_device = o_b.to(device, non_blocking=True)
                         a_device = a_b.to(device, non_blocking=True)
                         
-                        # Compute values and log-probs efficiently with scaled temperature
+                        # Compute values and log-probs efficiently
                         logits, v = net(o_device)
                         # Scale logits with temperature for smoother distribution
                         scaled_logits = logits / 1.5  # Temperature parameter
@@ -362,7 +467,7 @@ def main():
                            gd_epochs=args.ppo_gd, mb_size=args.ppo_mb,
                            grad_clip=args.grad_clip, device=device,
                            kl_coef=2.0, bc_coef=1.0)
-                mean_loss = 0.0  # Not tracked in PPO mode
+                mean_loss = 0.0  # Not tracked in standard PPO mode
             
             # Update learning rate
             scheduler.step()
