@@ -1,0 +1,34 @@
+A.L.E: Arcade Learning Environment (version 0.8.1+53f58b7)
+[Powered by Stella]
+Traceback (most recent call last):
+  File "/fs/atipa/home/017510883/RL_Pong_Project/RL_Project_Final/offline_pong/train_offline_ppo.py", line 304, in <module>
+    main()
+  File "/fs/atipa/home/017510883/RL_Pong_Project/RL_Project_Final/offline_pong/train_offline_ppo.py", line 180, in main
+    with h5py.File(args.dataset, 'r') as h5:
+  File "/fs/atipa/home/017510883/RL_Pong_Project/RL_Project_Final/.venv/lib64/python3.9/site-packages/h5py/_hl/files.py", line 564, in __init__
+    fid = make_fid(name, mode, userblock_size, fapl, fcpl, swmr=swmr)
+  File "/fs/atipa/home/017510883/RL_Pong_Project/RL_Project_Final/.venv/lib64/python3.9/site-packages/h5py/_hl/files.py", line 238, in make_fid
+    fid = h5f.open(name, flags, fapl=fapl)
+  File "h5py/_objects.pyx", line 54, in h5py._objects.with_phil.wrapper
+  File "h5py/_objects.pyx", line 55, in h5py._objects.with_phil.wrapper
+  File "h5py/h5f.pyx", line 102, in h5py.h5f.open
+FileNotFoundError: [Errno 2] Unable to synchronously open file (unable to open file: name = 'pong_offline_diverse.h5', errno = 2, error message = 'No such file or directory', flags = 0, o_flags = 0)
+srun: error: g19: task 0: Exited with exit code 1
+Running validation...
+A.L.E: Arcade Learning Environment (version 0.8.1+53f58b7)
+[Powered by Stella]
+Traceback (most recent call last):
+  File "/fs/atipa/home/017510883/RL_Pong_Project/RL_Project_Final/offline_pong/validate_model.py", line 131, in <module>
+    main()
+  File "/fs/atipa/home/017510883/RL_Pong_Project/RL_Project_Final/offline_pong/validate_model.py", line 120, in main
+    rewards = evaluate_ppo(args.model, device, args.episodes, args.render)
+  File "/fs/atipa/home/017510883/RL_Pong_Project/RL_Project_Final/offline_pong/validate_model.py", line 77, in evaluate_ppo
+    model.load_state_dict(torch.load(model_path, map_location=device))
+  File "/fs/atipa/home/017510883/RL_Pong_Project/RL_Project_Final/.venv/lib64/python3.9/site-packages/torch/serialization.py", line 1479, in load
+    with _open_file_like(f, "rb") as opened_file:
+  File "/fs/atipa/home/017510883/RL_Pong_Project/RL_Project_Final/.venv/lib64/python3.9/site-packages/torch/serialization.py", line 759, in _open_file_like
+    return _open_file(name_or_buffer, mode)
+  File "/fs/atipa/home/017510883/RL_Pong_Project/RL_Project_Final/.venv/lib64/python3.9/site-packages/torch/serialization.py", line 740, in __init__
+    super().__init__(open(name, mode))
+FileNotFoundError: [Errno 2] No such file or directory: 'pong_offline_diverse_best_ppo.pt'
+Finished at Tue May 13 01:18:00 PM PDT 2025
