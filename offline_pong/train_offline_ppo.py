@@ -90,7 +90,7 @@ def behaviour_cloning(net, opt, obs, act, bs, epochs, device):
 # ──────────────────── PPO minibatch update ────────────────────
 def ppo_update(net, opt, obs, act, old_lp, ret, adv,
                clip, vf_coef, ent_coef, gd_epochs, mb_size,
-               grad_clip, device, kl_coef=0.5, bc_coef=0.2):
+               grad_clip, device, kl_coef=2.0, bc_coef=1.0):
     dataset = TensorDataset(obs, act, old_lp, ret, adv)
     loader = DataLoader(dataset, batch_size=mb_size, shuffle=True, drop_last=True)
     for _ in range(gd_epochs):
@@ -154,16 +154,16 @@ def main():
     pa = argparse.ArgumentParser()
     pa.add_argument('--dataset', required=True)
     pa.add_argument('--epochs', type=int, default=30)
-    pa.add_argument('--bc_epochs', type=int, default=5)  # Increased BC epochs
+    pa.add_argument('--bc_epochs', type=int, default=10)  # Significantly more BC epochs
     pa.add_argument('--batch_size', type=int, default=4096)
     pa.add_argument('--ppo_mb', type=int, default=256)
     pa.add_argument('--ppo_gd', type=int, default=4)
-    pa.add_argument('--clip', type=float, default=0.2)
+    pa.add_argument('--clip', type=float, default=0.1)  # Reduced clip parameter for more conservative updates
     pa.add_argument('--vf_coef', type=float, default=0.5)
-    pa.add_argument('--ent_coef', type=float, default=0.005)  # Reduced entropy coefficient
+    pa.add_argument('--ent_coef', type=float, default=0.001)  # Further reduced entropy for offline learning
     pa.add_argument('--gamma', type=float, default=0.99)
     pa.add_argument('--lam',   type=float, default=0.95)
-    pa.add_argument('--lr',    type=float, default=2.5e-5)  # Even lower learning rate for stability
+    pa.add_argument('--lr',    type=float, default=1e-5)  # Much lower learning rate for stability
     pa.add_argument('--grad_clip', type=float, default=0.5)
     pa.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
     args = pa.parse_args()
@@ -226,9 +226,11 @@ def main():
                     o_device = o_b.to(device, non_blocking=True)
                     a_device = a_b.to(device, non_blocking=True)
                     
-                    # Compute values and log-probs efficiently
+                    # Compute values and log-probs efficiently with scaled temperature for smoother probabilities
                     logits, v = net(o_device)
-                    dist = torch.distributions.Categorical(logits=logits)
+                    # Scale logits with temperature for smoother distribution
+                    scaled_logits = logits / 1.5  # Temperature parameter
+                    dist = torch.distributions.Categorical(logits=scaled_logits)
                     olp_list.append(dist.log_prob(a_device).cpu())
                     v_list.append(v.cpu())
                     
@@ -248,17 +250,30 @@ def main():
                        clip=args.clip, vf_coef=args.vf_coef, ent_coef=args.ent_coef,
                        gd_epochs=args.ppo_gd, mb_size=args.ppo_mb,
                        grad_clip=args.grad_clip, device=device,
-                       kl_coef=0.5, bc_coef=0.2)  # Add KL and BC regularization
+                       kl_coef=2.0, bc_coef=1.0)  # Increased regularization weights
 
-            # --- quick evaluation ---
+            # --- quick evaluation with more episodes for reliability ---
             net.eval()
-            obs, _ = env.reset(); ep_ret, done = 0.0, False
-            while not done:
-                tensor = preprocess_obs(np.asarray(obs)).unsqueeze(0).to(device)
-                with torch.no_grad():
-                    act = torch.argmax(net(tensor)[0]).item()
-                obs, r, term, trunc, _ = env.step(act)
-                ep_ret += r; done = term or trunc
+            n_eval_episodes = 3  # Evaluate over more episodes
+            total_ret = 0.0
+            
+            for _ in range(n_eval_episodes):
+                obs, _ = env.reset(); ep_ret, done = 0.0, False
+                while not done:
+                    tensor = preprocess_obs(np.asarray(obs)).unsqueeze(0).to(device)
+                    with torch.no_grad():
+                        # Add some exploration during evaluation
+                        logits, _ = net(tensor)
+                        if np.random.random() < 0.1:  # 10% random actions
+                            act = env.action_space.sample()
+                        else:
+                            act = torch.argmax(logits).item()
+                    obs, r, term, trunc, _ = env.step(act)
+                    ep_ret += r; done = term or trunc
+                total_ret += ep_ret
+            
+            # Average return across episodes
+            ep_ret = total_ret / n_eval_episodes
 
             # Save model if it's the best so far
             if ep_ret > best_return:

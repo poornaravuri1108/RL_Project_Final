@@ -1,12 +1,12 @@
 #!/bin/bash
 #SBATCH --job-name=dqn_pong
-#SBATCH --output=slurm-%j.out
-#SBATCH --error=slurm-%j.err
+#SBATCH --output=dqn_pong_%j.out
+#SBATCH --error=dqn_pong_%j.err
 #SBATCH --mail-type=BEGIN,END,FAIL
 #SBATCH --mail-user=poorna.ravuri@sjsu.edu
 
 #SBATCH --partition=lgpuq
-#SBATCH --nodelist=g[16-19]
+#SBATCH --nodelist=g16
 ##SBATCH --exclusive
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=10
@@ -34,11 +34,20 @@ python --version
 
 cd offline_pong
 
-echo "Starting training at $(date)…"
+echo "Starting DQN training at $(date)..."
+
+# Redirect all output to log files
+exec > >(tee -a "dqn_training_${SLURM_JOB_ID}.log") 2>&1
+
 srun python train_dqn.py \
-      --dataset pong_offline.h5 \
+      --dataset pong_offline_diverse.h5 \
       --steps 500000 \
-      --batch-size 64 \
+      --batch-size 128 \
+      --use-cql \
       --device cuda
+
+# Run validation and log results
+echo "Running validation..."
+python validate_model.py --model dqn_pong.pt --type dqn --episodes 10
 
 echo "Finished at $(date)"
