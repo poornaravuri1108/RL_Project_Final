@@ -1,214 +1,227 @@
-import argparse
-import collections
+#!/usr/bin/env python3
+"""
+Offline PPO for Atari Pong (minimal action-set)
+
+✓ behaviour-cloning warm-up
+✓ batch-wise PPO to avoid CUDA OOM
+✓ gradient-norm clip + NaN/Inf guards + advantage clamp
+✓ CSV logging of evaluation returns
+✓ evaluation env uses AtariPreprocessing + FrameStack → 84×84×4 (same as dataset)
+
+Dataset keys expected:
+  observations uint8  (N, H, W, C) or (N, C, H, W)
+  actions      uint8/int64 (N,)
+  rewards      float32 (N,)
+  terminals    bool    (N,)
+"""
+import argparse, csv, os, sys, h5py, gymnasium as gym
 import numpy as np
-import torch
-from torch import nn
-from torch.utils.data import DataLoader
-import h5py
-import gymnasium as gym
+import torch, torch.nn as nn, torch.nn.functional as F
+from torch.utils.data import DataLoader, TensorDataset
+from gymnasium.wrappers import AtariPreprocessing, FrameStack
 
-# Convolutional backbone (Nature CNN) for 84x84 inputs
-class CNNBackbone(nn.Sequential):
-    def __init__(self, in_channels: int = 1):
-        super().__init__(
-            nn.Conv2d(in_channels, 32, kernel_size=8, stride=4), nn.ReLU(),
-            nn.Conv2d(32, 64, kernel_size=4, stride=2), nn.ReLU(),
-            nn.Conv2d(64, 64, kernel_size=3, stride=1), nn.ReLU(),
-            nn.Flatten()
-        )
-        # Calculate output dimension for a single 84x84 input
-        with torch.no_grad():
-            dummy = torch.zeros(1, in_channels, 84, 84)
-            conv_out = self.forward(dummy)
-        self.output_dim = conv_out.shape[1]
 
+# ─────────────────────────── network ────────────────────────────
 class ActorCritic(nn.Module):
-    def __init__(self, in_channels: int, n_actions: int):
+    def __init__(self, in_ch: int, n_actions: int):
         super().__init__()
-        self.body = CNNBackbone(in_channels)
-        self.policy_head = nn.Sequential(
-            nn.Linear(self.body.output_dim, 512), nn.ReLU(),
-            nn.Linear(512, n_actions)
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_ch, 32, 8, 4), nn.ReLU(),
+            nn.Conv2d(32, 64, 4, 2),   nn.ReLU(),
+            nn.Conv2d(64, 64, 3, 1),   nn.ReLU(),
         )
-        self.value_head = nn.Sequential(
-            nn.Linear(self.body.output_dim, 512), nn.ReLU(),
-            nn.Linear(512, 1)
-        )
+        with torch.no_grad():
+            dummy = torch.zeros(1, in_ch, 84, 84)
+            conv_out = int(np.prod(self.conv(dummy).shape[1:]))
+        self.fc = nn.Sequential(nn.Flatten(), nn.Linear(conv_out, 512), nn.ReLU())
+        self.pi = nn.Linear(512, n_actions)
+        self.v  = nn.Linear(512, 1)
 
-    def forward(self, x: torch.Tensor):
-        # Normalize pixel inputs
-        x = x / 255.0
-        z = self.body(x)
-        logits = self.policy_head(z)       # unnormalized action logits
-        value = self.value_head(z).squeeze(-1)  # state value
-        return logits, value
+    def forward(self, x):
+        x = x.float() / 255.0
+        x = self.fc(self.conv(x))
+        return self.pi(x), self.v(x).squeeze(-1)
 
-def compute_returns(rewards: torch.Tensor, gamma: float = 0.99) -> torch.Tensor:
-    """Compute discounted returns for a sequence of rewards (1D tensor)."""
-    returns = torch.zeros_like(rewards)
-    G = 0.0
-    # Compute returns backwards
-    for t in reversed(range(len(rewards))):
-        G = rewards[t] + gamma * G
-        returns[t] = G
-    return returns
 
-def train(dataset_path: str, epochs: int, device: str,
-          clip: float = 0.2, lr: float = 2.5e-4,
-          minibatch_size: int = 256, update_epochs: int = 4, seed: int = 42):
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    device = torch.device(device)
+# ─────────────────────── helper functions ───────────────────────
+def to_chw(arr: np.ndarray) -> np.ndarray:
+    """Convert NHWC/HWC/HW to NCHW/CHW."""
+    if arr.ndim == 4:
+        return arr if arr.shape[1] in (1, 4) else arr.transpose(0, 3, 1, 2)
+    if arr.ndim == 3:
+        if arr.shape[0] in (1, 4):
+            return arr
+        if arr.shape[2] in (1, 4):
+            return arr.transpose(2, 0, 1)
+        return arr[None, ...]
+    if arr.ndim == 2:
+        return arr[None, None, ...]
+    raise ValueError(f"Unexpected obs shape {arr.shape}")
 
-    # Initialize environment for evaluation
-    env = gym.make("ALE/Pong-v5", frameskip=1, obs_type="grayscale", render_mode=None)
-    env = gym.wrappers.AtariPreprocessing(env, frame_skip=4, grayscale_obs=True,
-                                          grayscale_newaxis=False, screen_size=84, scale_obs=False)
-    env = gym.wrappers.FrameStack(env, 4)
+
+def preprocess_obs(np_obs) -> torch.Tensor:
+    return torch.from_numpy(to_chw(np_obs))
+
+
+def discount_cumsum(rew, done, gamma):
+    out, csum = np.zeros_like(rew), 0.0
+    for i in reversed(range(len(rew))):
+        csum = rew[i] + gamma * csum * (1.0 - done[i])
+        out[i] = csum
+    return out
+
+
+# ───────────── behaviour-cloning warm-up ─────────────
+def behaviour_cloning(net, opt, obs, act, bs, epochs, device):
+    ce = nn.CrossEntropyLoss()
+    loader = DataLoader(TensorDataset(obs, act), bs, shuffle=True, drop_last=True)
+    net.train()
+    for ep in range(1, epochs + 1):
+        tot = 0.0
+        for o, a in loader:
+            o, a = o.to(device), a.to(device)
+            loss = ce(net(o)[0], a)
+            opt.zero_grad(set_to_none=True)
+            loss.backward(); opt.step()
+            tot += loss.item() * len(o)
+        print(f"[BC] epoch {ep}/{epochs} | loss {tot/len(obs):.4f}")
+
+
+# ──────────────────── PPO minibatch update ────────────────────
+def ppo_update(net, opt, obs, act, old_lp, ret, adv,
+               clip, vf_coef, ent_coef, gd_epochs, mb_size,
+               grad_clip, device):
+    dataset = TensorDataset(obs, act, old_lp, ret, adv)
+    loader = DataLoader(dataset, batch_size=mb_size, shuffle=True, drop_last=True)
+    for _ in range(gd_epochs):
+        for o, a, olp, r, ad in loader:
+            o, a, olp, r, ad = [t.to(device) for t in (o, a, olp, r, ad)]
+
+            logits, v = net(o)
+            if not torch.isfinite(logits).all() or not torch.isfinite(v).all():
+                continue  # skip corrupt batch
+
+            dist = torch.distributions.Categorical(logits=logits)
+            lp = dist.log_prob(a)
+            ratio = torch.exp(lp - olp)
+            if not torch.isfinite(ratio).all():
+                continue
+
+            obj1 = ratio * ad
+            obj2 = torch.clamp(ratio, 1 - clip, 1 + clip) * ad
+            loss_pi = -torch.min(obj1, obj2).mean()
+            loss_v  = F.mse_loss(v, r)
+            loss = loss_pi + vf_coef * loss_v - ent_coef * dist.entropy().mean()
+            if torch.isnan(loss) or torch.isinf(loss):
+                continue
+
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(net.parameters(), grad_clip)
+            opt.step()
+
+
+# ─────────────────────────── main ────────────────────────────
+def main():
+    pa = argparse.ArgumentParser()
+    pa.add_argument('--dataset', required=True)
+    pa.add_argument('--epochs', type=int, default=30)
+    pa.add_argument('--bc_epochs', type=int, default=3)
+    pa.add_argument('--batch_size', type=int, default=4096)
+    pa.add_argument('--ppo_mb', type=int, default=256)
+    pa.add_argument('--ppo_gd', type=int, default=4)
+    pa.add_argument('--clip', type=float, default=0.2)
+    pa.add_argument('--vf_coef', type=float, default=0.5)
+    pa.add_argument('--ent_coef', type=float, default=0.01)
+    pa.add_argument('--gamma', type=float, default=0.99)
+    pa.add_argument('--lam',   type=float, default=0.95)
+    pa.add_argument('--lr',    type=float, default=5.0e-5)   # <-- lower LR
+    pa.add_argument('--grad_clip', type=float, default=0.5)
+    pa.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
+    args = pa.parse_args()
+    device = torch.device(args.device)
+
+    # ─── evaluation env (minimal 6-action set) ───
+    base = gym.make("ALE/Pong-v5", frameskip=1,
+                    full_action_space=False, render_mode=None)
+    env = FrameStack(AtariPreprocessing(base, grayscale_obs=True,
+                                        scale_obs=True, frame_skip=1), 4)
     n_actions = env.action_space.n
 
-    # Determine observation channels from dataset
-    with h5py.File(dataset_path, 'r') as h5:
-        sample = h5['observations'][0]
-    sample = np.array(sample)
-    if sample.ndim == 3:
-        if sample.shape[0] in [1, 4]:
-            in_channels = sample.shape[0]
-        elif sample.shape[-1] in [1, 4]:
-            in_channels = sample.shape[-1]
-        else:
-            in_channels = 1
-    else:
-        in_channels = 1
+    # ─── load dataset ───
+    with h5py.File(args.dataset, 'r') as h5:
+        obs_np  = h5['observations'][:]
+        act_np  = h5['actions'][:].astype(np.int64)
+        rew_np  = h5['rewards'][:]
+        done_np = h5['terminals'][:].astype(bool)
 
-    net = ActorCritic(in_channels, n_actions).to(device)
-    optimizer = torch.optim.Adam(net.parameters(), lr=lr)
-    scaler = torch.cuda.amp.GradScaler() if device.type == 'cuda' else None
+    if act_np.max()+1 != n_actions:
+        sys.exit(f"Dataset actions ({act_np.max()+1}) ≠ env actions ({n_actions})")
 
-    # For logging results
-    log_data = [("step", "average_reward")]
-    total_updates = 0
+    obs_t = preprocess_obs(obs_np)          # uint8 CHW
+    act_t = torch.from_numpy(act_np).long()
+    ret_t = torch.from_numpy(discount_cumsum(rew_np, done_np, args.gamma).astype(np.float32))
 
-    # Training loop over epochs and episodes
-    for epoch in range(1, epochs + 1):
-        # Open dataset file for reading episodes sequentially
-        with h5py.File(dataset_path, 'r') as h5:
-            obs_ds = h5['observations']
-            act_ds = h5['actions']
-            rew_ds = h5['rewards']
-            term_ds = h5['terminals']
-            data_len = len(obs_ds)
-            idx = 0
-            # Iterate through each episode in the dataset
-            while idx < data_len:
-                # Collect one episode
-                obs_list, act_list, rew_list = [], [], []
-                done = False
-                while idx < data_len and not done:
-                    obs_list.append(np.array(obs_ds[idx]))
-                    act_list.append(act_ds[idx])
-                    rew_list.append(rew_ds[idx])
-                    done = bool(term_ds[idx])
-                    idx += 1
-                # Convert episode to tensors
-                obs_ep = torch.tensor(np.array(obs_list), dtype=torch.float32, device=device)
-                act_ep = torch.tensor(act_list, dtype=torch.long, device=device)
-                rew_ep = torch.tensor(rew_list, dtype=torch.float32, device=device)
-                # Add channel dim to observations if needed
-                if obs_ep.ndim == 3:
-                    # If obs_ep shape is (T, H, W, C) or (T, C, H, W)
-                    if obs_ep.shape[1] not in [1, 4] and obs_ep.shape[-1] in [1, 4]:
-                        # Permute from (T, H, W, C) to (T, C, H, W)
-                        obs_ep = obs_ep.permute(0, 3, 1, 2)
-                    elif obs_ep.shape[1] not in [1, 4] and obs_ep.shape[-1] not in [1, 4]:
-                        obs_ep = obs_ep.unsqueeze(1)  # (T, H, W) -> (T,1,H,W)
-                elif obs_ep.ndim == 4 and obs_ep.shape[1] not in [1, 4] and obs_ep.shape[-1] in [1, 4]:
-                    obs_ep = obs_ep.permute(0, 3, 1, 2)
-                # Compute old policy log-probs and state values (no grad)
-                with torch.no_grad():
-                    logits, vals = net(obs_ep)
+    # ─── model & optimiser ───
+    net = ActorCritic(obs_t.shape[1], n_actions).to(device)
+    opt = torch.optim.Adam(net.parameters(), lr=args.lr)
+
+    # ─── behaviour cloning ───
+    if args.bc_epochs:
+        behaviour_cloning(net, opt, obs_t, act_t,
+                          bs=args.ppo_mb, epochs=args.bc_epochs, device=device)
+
+    # ─── CSV logger ───
+    log_path = os.path.splitext(args.dataset)[0] + "_training_log.csv"
+    with open(log_path, 'w', newline='') as fcsv:
+        writer = csv.writer(fcsv); writer.writerow(['epoch', 'eval_return'])
+
+        # ─── PPO epochs ───
+        for ep in range(1, args.epochs + 1):
+            # --- compute old log-probs + values batch-wise ---
+            net.eval()
+            olp_list, v_list = [], []
+            loader = DataLoader(TensorDataset(obs_t, act_t),
+                                batch_size=args.batch_size, shuffle=False)
+            with torch.no_grad():
+                for o_b, a_b in loader:
+                    logits, v = net(o_b.to(device))
                     dist = torch.distributions.Categorical(logits=logits)
-                    old_log_prob = dist.log_prob(act_ep)
-                    # Advantage estimation: compute returns and subtract values
-                    returns = compute_returns(rew_ep, gamma=0.99).to(device)
-                    advantage = returns - vals
-                    advantage = (advantage - advantage.mean()) / (advantage.std() + 1e-8)
-                # PPO updates for this episode
-                for _ in range(update_epochs):
-                    # Shuffle indices for mini-batches
-                    perm = torch.randperm(len(obs_ep), device=device)
-                    for start in range(0, len(obs_ep), minibatch_size):
-                        end = start + minibatch_size
-                        idx_mb = perm[start:end]
-                        mb_obs = obs_ep[idx_mb]
-                        mb_act = act_ep[idx_mb]
-                        mb_adv = advantage[idx_mb]
-                        mb_ret = returns[idx_mb]
-                        mb_old_logp = old_log_prob[idx_mb]
+                    olp_list.append(dist.log_prob(a_b.to(device)).cpu())
+                    v_list.append(v.cpu())
+            old_lp = torch.cat(olp_list)
+            val_t  = torch.cat(v_list)
 
-                        # Forward pass with AMP (if enabled)
-                        with torch.cuda.amp.autocast(enabled=(scaler is not None)):
-                            logits, values = net(mb_obs)
-                            dist = torch.distributions.Categorical(logits=logits)
-                            new_logp = dist.log_prob(mb_act)
-                            # Calculate PPO loss components
-                            log_ratio = new_logp - mb_old_logp
-                            ratio = torch.exp(log_ratio)
-                            surr1 = ratio * mb_adv
-                            surr2 = torch.clamp(ratio, 1.0 - clip, 1.0 + clip) * mb_adv
-                            policy_loss = -torch.min(surr1, surr2).mean()
-                            value_loss = 0.5 * (mb_ret - values).pow(2).mean()
-                            entropy_loss = -0.01 * dist.entropy().mean()
-                            loss = policy_loss + value_loss + entropy_loss
-                        # Backpropagate loss
-                        optimizer.zero_grad()
-                        if scaler:
-                            scaler.scale(loss).backward()
-                            scaler.step(optimizer)
-                            scaler.update()
-                        else:
-                            loss.backward()
-                            optimizer.step()
-                        total_updates += 1
-        # End of epoch: evaluate policy on environment
-        total_reward = 0.0
-        eval_episodes = 10
-        net.eval()
-        for _ in range(eval_episodes):
-            obs, _ = env.reset()
-            obs = np.array(obs)
-            done_flag = False
-            episode_reward = 0.0
-            while not done_flag:
-                obs_tensor = torch.tensor(obs, dtype=torch.float32, device=device)
-                if obs_tensor.ndim == 3 and obs_tensor.shape[0] not in [1, 4]:
-                    obs_tensor = obs_tensor.permute(2, 0, 1)
-                elif obs_tensor.ndim == 2:
-                    obs_tensor = obs_tensor.unsqueeze(0)
+            adv_t = (ret_t - val_t)
+            adv_t = (adv_t - adv_t.mean()) / (adv_t.std() + 1e-8)
+            adv_t = torch.clamp(adv_t, -10.0, 10.0)  # clamp extremes
+
+            # --- PPO update ---
+            net.train()
+            ppo_update(net, opt, obs_t, act_t, old_lp, ret_t, adv_t,
+                       clip=args.clip, vf_coef=args.vf_coef, ent_coef=args.ent_coef,
+                       gd_epochs=args.ppo_gd, mb_size=args.ppo_mb,
+                       grad_clip=args.grad_clip, device=device)
+
+            # --- quick evaluation ---
+            net.eval()
+            obs, _ = env.reset(); ep_ret, done = 0.0, False
+            while not done:
+                tensor = preprocess_obs(np.asarray(obs)).unsqueeze(0).to(device)
                 with torch.no_grad():
-                    logits, _ = net(obs_tensor.unsqueeze(0))
-                    action = int(torch.argmax(logits, dim=-1).item())
-                obs, reward, done_flag, _, _ = env.step(action)
-                obs = np.array(obs)
-                episode_reward += reward
-            total_reward += episode_reward
-        net.train()
-        avg_return = total_reward / eval_episodes
-        print(f"Epoch {epoch}: PPO average return = {avg_return:.2f}")
-        log_data.append((total_updates, avg_return))
-    # Save model after training
-    torch.save(net.state_dict(), "ppo_offline.pt")
-    # Write training log to CSV
-    with open("ppo_logs.csv", "w") as f:
-        f.write("step,average_reward\n")
-        for step, rew in log_data[1:]:
-            f.write(f"{step},{rew:.2f}\n")
+                    act = torch.argmax(net(tensor)[0]).item()
+                obs, r, term, trunc, _ = env.step(act)
+                ep_ret += r; done = term or trunc
+
+            print(f"Epoch {ep:03d}/{args.epochs} | eval return {ep_ret:5.1f}")
+            writer.writerow([ep, ep_ret]); fcsv.flush()
+
+    env.close()
+    ckpt_path = os.path.splitext(args.dataset)[0] + "_ppo.pt"
+    torch.save(net.state_dict(), ckpt_path)
+    print(f"✓ finished - model → {ckpt_path}\n✓ log → {log_path}")
+
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", default="pong_offline.h5", help="Path to HDF5 offline dataset")
-    parser.add_argument("--epochs", type=int, default=10, help="Number of training epochs for PPO")
-    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu", help="Device to train on")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    args = parser.parse_args()
-    train(args.dataset, args.epochs, args.device, seed=args.seed)
+    main()
+
