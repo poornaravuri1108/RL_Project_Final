@@ -183,17 +183,19 @@ def train(dataset_path, steps, batch_size, device, seed, cql_alpha=1.0, use_cql=
         
         # CQL loss for conservative Q-learning if enabled
         if use_cql:
-            # Random sample negative actions for each state
-            random_actions = torch.randint(0, n_actions, (batch_size * 10,), device=dev)
-            random_state_actions = torch.randint(0, batch_size, (batch_size * 10,), device=dev)
+            # Compute logsumexp over Q-values (proper CQL implementation)
+            logsumexp_q = torch.logsumexp(q_vals, dim=1)
             
-            # CQL specific regularization
-            random_q = q_vals.mean(dim=1)  # Expectation over actions
-            dataset_q = q_sa  # Q-values for actions in dataset
+            # CQL specific regularization - more stable implementation
+            # This implements min_Q = TD_target - alpha * (logsumexp(Q) - Q(s,a))
+            cql_loss = (logsumexp_q - q_sa).mean()
             
-            # Compute CQL loss - penalizes overestimation of Q-values
-            cql_loss = random_q.mean() - dataset_q.mean()
+            # Apply cql_alpha with proper scaling & clipping to prevent extreme values
+            cql_loss = torch.clamp(cql_loss, -20.0, 20.0)  # Prevent extreme values
             loss = td_loss + cql_alpha * cql_loss
+            
+            # Ensure loss doesn't reach extreme values
+            loss = torch.clamp(loss, -100.0, 100.0)
         else:
             loss = td_loss
         optimizer.zero_grad()
