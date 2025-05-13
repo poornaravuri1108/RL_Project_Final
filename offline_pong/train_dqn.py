@@ -59,7 +59,7 @@ class DQNNetwork(nn.Module):
         return val + adv - adv.mean(dim=1, keepdim=True)
 
 
-def train(dataset_path, steps, batch_size, device, seed):
+def train(dataset_path, steps, batch_size, device, seed, cql_alpha=1.0, use_cql=True, td_clip=10.0):
     # configure logging
     logging.basicConfig(
         format="%(asctime)s %(levelname)s: %(message)s",
@@ -158,20 +158,46 @@ def train(dataset_path, steps, batch_size, device, seed):
         acts_t = torch.tensor(acts, dtype=torch.long, device=dev)
         rews_t = torch.tensor(rews, dtype=torch.float32, device=dev)
         done_t = torch.tensor(dones, dtype=torch.float32, device=dev)
+        
+        # Scale rewards for better learning dynamics
+        rews_t = torch.clamp(rews_t, -1.0, 1.0)
 
         # compute Q(s,a)
         q_vals = policy_net(obs_t)
         q_sa   = q_vals.gather(1, acts_t.unsqueeze(1)).squeeze(1)
 
-        # compute Double DQN target
+        # compute Double DQN target with TD-error clipping for stability
         with torch.no_grad():
             q_next_policy = policy_net(nxt_t)
             next_actions  = q_next_policy.argmax(dim=1, keepdim=True)
             q_next_target = target_net(nxt_t).gather(1, next_actions).squeeze(1)
             q_target      = rews_t + gamma * q_next_target * (1 - done_t)
-
-        # loss and backward
-        loss = F.smooth_l1_loss(q_sa, q_target)
+            
+            # TD-error clipping for stability
+            td_error = q_target - q_sa
+            td_error = torch.clamp(td_error, -td_clip, td_clip)
+            q_target = q_sa + td_error
+        
+        # Standard TD loss
+        td_loss = F.smooth_l1_loss(q_sa, q_target)
+        
+        # CQL loss for conservative Q-learning if enabled
+        if use_cql:
+            # Compute logsumexp over Q-values (proper CQL implementation)
+            logsumexp_q = torch.logsumexp(q_vals, dim=1)
+            
+            # CQL specific regularization - more stable implementation
+            # This implements min_Q = TD_target - alpha * (logsumexp(Q) - Q(s,a))
+            cql_loss = (logsumexp_q - q_sa).mean()
+            
+            # Apply cql_alpha with proper scaling & clipping to prevent extreme values
+            cql_loss = torch.clamp(cql_loss, -20.0, 20.0)  # Prevent extreme values
+            loss = td_loss + cql_alpha * cql_loss
+            
+            # Ensure loss doesn't reach extreme values
+            loss = torch.clamp(loss, -100.0, 100.0)
+        else:
+            loss = td_loss
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
@@ -197,8 +223,15 @@ def train(dataset_path, steps, batch_size, device, seed):
             "nz/bs": f"{int(nz_frac*batch_size)}/{batch_size}"
         })
 
+        # Add performance tracking: calculate average Q-values
+        avg_q = q_vals.mean().item()
+        
+        # Add early validation to check progress
+        if step % 20_000 == 0:
+            logging.info(f"[Step {step}] Avg Q-value: {avg_q:.3f}, Loss: {loss.item():.3f}")
+            
         # periodic evaluation
-        if step % 100_000 == 0 or step == steps:
+        if step % 50_000 == 0 or step == steps:  # Evaluate more frequently
             total_r = 0.0
             trials = 5
             for _ in range(trials):
@@ -235,8 +268,15 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset",    default="pong_offline.h5")
     parser.add_argument("--steps",      type=int,   default=500_000)
-    parser.add_argument("--batch-size", type=int,   default=64)
+    parser.add_argument("--batch-size", type=int,   default=128)  # Increased batch size
     parser.add_argument("--device",     default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--seed",       type=int,   default=42)
+    parser.add_argument("--cql-alpha", type=float, default=1.0,
+                        help="Weight for CQL loss term (Conservative Q-Learning)")
+    parser.add_argument("--use-cql",   action="store_true", default=True,
+                        help="Whether to use Conservative Q-Learning")
+    parser.add_argument("--td-clip",   type=float, default=10.0,
+                        help="Clipping threshold for TD errors")
     args = parser.parse_args()
-    train(args.dataset, args.steps, args.batch_size, args.device, args.seed)
+    train(args.dataset, args.steps, args.batch_size, args.device, args.seed, 
+          args.cql_alpha, args.use_cql, args.td_clip)

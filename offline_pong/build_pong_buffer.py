@@ -68,9 +68,14 @@ def main(transitions: int, out_path: str, device: str):
         count = 0
 
         while count < transitions:
-            # Predict action (deterministic) given current stacked frames
-            action, _ = model.predict(obs, deterministic=True)
-            a = int(action)  # ensure Python int
+            # Mix deterministic and stochastic actions to increase dataset diversity
+            if np.random.random() < 0.3:  # 30% chance of random exploration
+                a = int(np.random.randint(0, env.action_space.n))
+            else:
+                # Use pretrained policy with some randomness
+                deterministic = np.random.random() < 0.7  # 70% deterministic, 30% stochastic
+                action, _ = model.predict(obs, deterministic=deterministic)
+                a = int(action)  # ensure Python int
 
             # Step environment (expects list of actions for each env)
             obs_next, reward, done, infos = env.step([a])

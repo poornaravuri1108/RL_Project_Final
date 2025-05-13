@@ -1,12 +1,12 @@
 #!/bin/bash
 #SBATCH --job-name=ppo_pong
-#SBATCH --output=slurm-%j.out
-#SBATCH --error=slurm-%j.err
+#SBATCH --output=ppo_pong_%j.out
+#SBATCH --error=ppo_pong_%j.err
 #SBATCH --mail-type=BEGIN,END,FAIL
 #SBATCH --mail-user=poorna.ravuri@sjsu.edu
 
 #SBATCH --partition=lgpuq
-#SBATCH --nodelist=g[16-19]
+#SBATCH --nodelist=g19
 ##SBATCH --exclusive
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=10
@@ -33,11 +33,19 @@ echo "CUDA_VISIBLE_DEVICES: $CUDA_VISIBLE_DEVICES"
 python --version
 
 cd offline_pong
-echo "Starting PPO training at $(date)…"
+echo "Starting PPO training at $(date)..."
+
+# Redirect all output to log files
+exec > >(tee -a "ppo_training_${SLURM_JOB_ID}.log") 2>&1
+
 srun python train_offline_ppo.py \
-      --dataset pong_offline.h5 \
-      --epochs 20 \
+      --dataset pong_offline_diverse.h5 \
+      --epochs 30 \
       --device cuda
+
+# Run validation and log results
+echo "Running validation..."
+python validate_model.py --model pong_offline_diverse_best_ppo.pt --type ppo --episodes 10
 
 echo "Finished at $(date)"
 
