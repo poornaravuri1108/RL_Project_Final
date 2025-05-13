@@ -90,7 +90,7 @@ def behaviour_cloning(net, opt, obs, act, bs, epochs, device):
 # ──────────────────── PPO minibatch update ────────────────────
 def ppo_update(net, opt, obs, act, old_lp, ret, adv,
                clip, vf_coef, ent_coef, gd_epochs, mb_size,
-               grad_clip, device):
+               grad_clip, device, kl_coef=0.5, bc_coef=0.2):
     dataset = TensorDataset(obs, act, old_lp, ret, adv)
     loader = DataLoader(dataset, batch_size=mb_size, shuffle=True, drop_last=True)
     for _ in range(gd_epochs):
@@ -109,9 +109,21 @@ def ppo_update(net, opt, obs, act, old_lp, ret, adv,
 
             obj1 = ratio * ad
             obj2 = torch.clamp(ratio, 1 - clip, 1 + clip) * ad
+            # Standard PPO objective
             loss_pi = -torch.min(obj1, obj2).mean()
-            loss_v  = F.mse_loss(v, r)
-            loss = loss_pi + vf_coef * loss_v - ent_coef * dist.entropy().mean()
+            
+            # Value loss
+            loss_v = F.mse_loss(v, r)
+            
+            # Behavior cloning loss to stay close to dataset policy
+            bc_loss = F.cross_entropy(logits, a)
+            
+            # KL divergence term to prevent policy deviation
+            kl_div = (torch.exp(lp) * (lp - olp)).mean()
+            
+            # Combined loss
+            loss = loss_pi + vf_coef * loss_v + kl_coef * kl_div + bc_coef * bc_loss - ent_coef * dist.entropy().mean()
+            
             if torch.isnan(loss) or torch.isinf(loss):
                 continue
 
@@ -121,21 +133,37 @@ def ppo_update(net, opt, obs, act, old_lp, ret, adv,
             opt.step()
 
 
+# ── Simple evaluation function for testing during training ──
+def evaluate_policy(net, env, device, n_episodes=3):
+    net.eval()
+    total_reward = 0.0
+    for _ in range(n_episodes):
+        obs, _ = env.reset()
+        done = False
+        while not done:
+            tensor = preprocess_obs(np.asarray(obs)).unsqueeze(0).to(device)
+            with torch.no_grad():
+                act = torch.argmax(net(tensor)[0]).item()
+            obs, r, term, trunc, _ = env.step(act)
+            total_reward += r
+            done = term or trunc
+    return total_reward / n_episodes
+
 # ─────────────────────────── main ────────────────────────────
 def main():
     pa = argparse.ArgumentParser()
     pa.add_argument('--dataset', required=True)
     pa.add_argument('--epochs', type=int, default=30)
-    pa.add_argument('--bc_epochs', type=int, default=3)
+    pa.add_argument('--bc_epochs', type=int, default=5)  # Increased BC epochs
     pa.add_argument('--batch_size', type=int, default=4096)
     pa.add_argument('--ppo_mb', type=int, default=256)
     pa.add_argument('--ppo_gd', type=int, default=4)
     pa.add_argument('--clip', type=float, default=0.2)
     pa.add_argument('--vf_coef', type=float, default=0.5)
-    pa.add_argument('--ent_coef', type=float, default=0.01)
+    pa.add_argument('--ent_coef', type=float, default=0.005)  # Reduced entropy coefficient
     pa.add_argument('--gamma', type=float, default=0.99)
     pa.add_argument('--lam',   type=float, default=0.95)
-    pa.add_argument('--lr',    type=float, default=5.0e-5)   # <-- lower LR
+    pa.add_argument('--lr',    type=float, default=2.5e-5)  # Even lower learning rate for stability
     pa.add_argument('--grad_clip', type=float, default=0.5)
     pa.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
     args = pa.parse_args()
@@ -164,7 +192,8 @@ def main():
 
     # ─── model & optimiser ───
     net = ActorCritic(obs_t.shape[1], n_actions).to(device)
-    opt = torch.optim.Adam(net.parameters(), lr=args.lr)
+    # Use a different optimizer with weight decay for regularization
+    opt = torch.optim.AdamW(net.parameters(), lr=args.lr, weight_decay=1e-4)
 
     # ─── behaviour cloning ───
     if args.bc_epochs:
@@ -176,6 +205,10 @@ def main():
     with open(log_path, 'w', newline='') as fcsv:
         writer = csv.writer(fcsv); writer.writerow(['epoch', 'eval_return'])
 
+        # ─── Add checkpoint saver ───
+        best_return = float('-inf')
+        best_epoch = 0
+        
         # ─── PPO epochs ───
         for ep in range(1, args.epochs + 1):
             # --- compute old log-probs + values batch-wise ---
@@ -201,7 +234,8 @@ def main():
             ppo_update(net, opt, obs_t, act_t, old_lp, ret_t, adv_t,
                        clip=args.clip, vf_coef=args.vf_coef, ent_coef=args.ent_coef,
                        gd_epochs=args.ppo_gd, mb_size=args.ppo_mb,
-                       grad_clip=args.grad_clip, device=device)
+                       grad_clip=args.grad_clip, device=device,
+                       kl_coef=0.5, bc_coef=0.2)  # Add KL and BC regularization
 
             # --- quick evaluation ---
             net.eval()
@@ -213,8 +247,24 @@ def main():
                 obs, r, term, trunc, _ = env.step(act)
                 ep_ret += r; done = term or trunc
 
-            print(f"Epoch {ep:03d}/{args.epochs} | eval return {ep_ret:5.1f}")
+            # Save model if it's the best so far
+            if ep_ret > best_return:
+                best_return = ep_ret
+                best_epoch = ep
+                torch.save(net.state_dict(), os.path.splitext(args.dataset)[0] + "_best_ppo.pt")
+                print(f"Epoch {ep:03d}/{args.epochs} | eval return {ep_ret:5.1f} | NEW BEST!")
+            else:
+                print(f"Epoch {ep:03d}/{args.epochs} | eval return {ep_ret:5.1f} | Best: {best_return:.1f} (ep {best_epoch})")
+            
             writer.writerow([ep, ep_ret]); fcsv.flush()
+            
+            # Simple early stopping - if we're close to winning, do more evaluation to confirm
+            if ep_ret > 15:
+                confirm_return = evaluate_policy(net, env, device, n_episodes=5)
+                print(f"Confirmation evaluation: {confirm_return:.1f}")
+                if confirm_return > 18:  # If consistently good, we can stop
+                    print(f"Early stopping at epoch {ep} with return {confirm_return:.1f}")
+                    break
 
     env.close()
     ckpt_path = os.path.splitext(args.dataset)[0] + "_ppo.pt"
