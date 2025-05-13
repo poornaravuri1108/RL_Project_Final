@@ -1,0 +1,29 @@
+2025-05-13 13:18:52,235 INFO: Starting DQN training: dataset=pong_offline_diverse.h5, steps=500000, batch=128, device=cuda
+A.L.E: Arcade Learning Environment (version 0.8.1+53f58b7)
+[Powered by Stella]
+2025-05-13 13:18:53,804 INFO: Eval env ready — n_actions=6
+Traceback (most recent call last):
+  File "/fs/atipa/home/017510883/RL_Pong_Project/RL_Project_Final/offline_pong/train_dqn.py", line 281, in <module>
+    train(args.dataset, args.steps, args.batch_size, args.device, args.seed, 
+  File "/fs/atipa/home/017510883/RL_Pong_Project/RL_Project_Final/offline_pong/train_dqn.py", line 86, in train
+    h5 = h5py.File(dataset_path, "r")
+  File "/fs/atipa/home/017510883/RL_Pong_Project/RL_Project_Final/.venv/lib64/python3.9/site-packages/h5py/_hl/files.py", line 564, in __init__
+    fid = make_fid(name, mode, userblock_size, fapl, fcpl, swmr=swmr)
+  File "/fs/atipa/home/017510883/RL_Pong_Project/RL_Project_Final/.venv/lib64/python3.9/site-packages/h5py/_hl/files.py", line 238, in make_fid
+    fid = h5f.open(name, flags, fapl=fapl)
+  File "h5py/_objects.pyx", line 54, in h5py._objects.with_phil.wrapper
+  File "h5py/_objects.pyx", line 55, in h5py._objects.with_phil.wrapper
+  File "h5py/h5f.pyx", line 102, in h5py.h5f.open
+FileNotFoundError: [Errno 2] Unable to synchronously open file (unable to open file: name = 'pong_offline_diverse.h5', errno = 2, error message = 'No such file or directory', flags = 0, o_flags = 0)
+srun: error: g16: task 0: Exited with exit code 1
+Running validation...
+A.L.E: Arcade Learning Environment (version 0.8.1+53f58b7)
+[Powered by Stella]
+Evaluating DQN:   0%|          | 0/10 [00:00<?, ?it/s]Evaluating DQN:  10%|█         | 1/10 [00:07<01:07,  7.51s/it]Evaluating DQN:  20%|██        | 2/10 [00:14<00:56,  7.07s/it]Evaluating DQN:  30%|███       | 3/10 [00:20<00:48,  6.89s/it]Evaluating DQN:  40%|████      | 4/10 [00:27<00:39,  6.58s/it]Evaluating DQN:  50%|█████     | 5/10 [00:33<00:32,  6.46s/it]Evaluating DQN:  60%|██████    | 6/10 [00:39<00:26,  6.53s/it]Evaluating DQN:  70%|███████   | 7/10 [00:46<00:19,  6.46s/it]Evaluating DQN:  80%|████████  | 8/10 [00:52<00:12,  6.34s/it]Evaluating DQN:  90%|█████████ | 9/10 [00:58<00:06,  6.27s/it]Evaluating DQN: 100%|██████████| 10/10 [01:05<00:00,  6.40s/it]Evaluating DQN: 100%|██████████| 10/10 [01:05<00:00,  6.52s/it]
+
+Evaluation results for dqn_pong.pt (dqn):
+  Episodes: 10
+  Average reward: -20.60 ± 0.49
+  Min/Max reward: -21.0/-20.0
+  Rewards: [-21.0, -20.0, -20.0, -21.0, -21.0, -20.0, -21.0, -21.0, -21.0, -20.0]
+Finished at Tue May 13 01:20:18 PM PDT 2025
