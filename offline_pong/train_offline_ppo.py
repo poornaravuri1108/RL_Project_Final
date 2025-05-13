@@ -216,12 +216,25 @@ def main():
             olp_list, v_list = [], []
             loader = DataLoader(TensorDataset(obs_t, act_t),
                                 batch_size=args.batch_size, shuffle=False)
+            
+            # Add progress bar for data processing phase
+            print(f"Computing log-probs & values for epoch {ep}/{args.epochs}...")
             with torch.no_grad():
-                for o_b, a_b in loader:
-                    logits, v = net(o_b.to(device))
+                # Use tqdm for progress tracking
+                for o_b, a_b in tqdm(loader, desc="Data processing", ncols=80):
+                    # Process in larger batches if possible
+                    o_device = o_b.to(device, non_blocking=True)
+                    a_device = a_b.to(device, non_blocking=True)
+                    
+                    # Compute values and log-probs efficiently
+                    logits, v = net(o_device)
                     dist = torch.distributions.Categorical(logits=logits)
-                    olp_list.append(dist.log_prob(a_b.to(device)).cpu())
+                    olp_list.append(dist.log_prob(a_device).cpu())
                     v_list.append(v.cpu())
+                    
+                    # Free memory
+                    torch.cuda.empty_cache() if device.type == 'cuda' else None
+                    
             old_lp = torch.cat(olp_list)
             val_t  = torch.cat(v_list)
 
