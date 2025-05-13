@@ -19,7 +19,7 @@ import numpy as np
 import torch, torch.nn as nn, torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 from gymnasium.wrappers import AtariPreprocessing, FrameStack
-
+from tqdm import tqdm
 
 # ─────────────────────────── network ────────────────────────────
 class ActorCritic(nn.Module):
