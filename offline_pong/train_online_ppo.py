@@ -170,10 +170,11 @@ class PongRewardShaping(gym.Wrapper):
         return obs, shaped_reward, terminated, truncated, info
 
 
-def make_env(seed=0, difficulty=0.0):
+def make_env(seed=0, difficulty=0):
     """Create a preprocessed Pong environment with curriculum learning"""
     def _init():
-        # The difficulty parameter controls opponent skill (0.0=easy, 1.0=hard)
+        # The difficulty parameter controls opponent skill (0=easy, 3=hard)
+        # Pong difficulty levels are integers (0,1,2,3)
         env = gym.make("ALE/Pong-v5", frameskip=1, full_action_space=False, difficulty=difficulty)
         env = AtariPreprocessing(env, grayscale_obs=True, scale_obs=False, frame_skip=4)
         env = FrameStack(env, 4)
@@ -260,8 +261,8 @@ def collect_rollout(envs, model, rollout_steps, device):
 
 def evaluate_policy(model, n_episodes=10, device='cuda'):
     """Evaluate the policy on the environment"""
-    # Evaluate on max difficulty (1.0) to get a true measure of performance
-    env = gym.make("ALE/Pong-v5", frameskip=1, full_action_space=False, difficulty=1.0)
+    # Evaluate on standard difficulty (1) to get a measure of performance
+    env = gym.make("ALE/Pong-v5", frameskip=1, full_action_space=False, difficulty=1)
     env = AtariPreprocessing(env, grayscale_obs=True, scale_obs=False, frame_skip=4)
     env = FrameStack(env, 4)
     # Note: We don't use reward shaping during evaluation to get true performance
@@ -313,8 +314,8 @@ def main():
     torch.manual_seed(args.seed)
     
     # Create vectorized environments with curriculum learning
-    # Start with easier difficulty to help the agent learn fundamentals
-    initial_difficulty = 0.0
+    # Start with easiest difficulty (0) to help the agent learn fundamentals
+    initial_difficulty = 0  # Integer difficulty level
     env_fns = [make_env(args.seed + i, difficulty=initial_difficulty) for i in range(args.num_envs)]
     envs = SyncVectorEnv(env_fns)
     
@@ -343,8 +344,8 @@ def main():
     # Curriculum learning variables
     curriculum_threshold = -15.0  # When to increase difficulty
     current_difficulty = initial_difficulty
-    max_difficulty = 1.0
-    difficulty_step = 0.2  # How much to increase difficulty
+    max_difficulty = 3  # Pong has difficulty levels 0,1,2,3
+    difficulty_step = 1  # Increase by 1 level at a time
     
     print(f"Starting training for {args.steps} steps with {args.num_envs} environments")
     print(f"Device: {args.device}, Batch size: {args.batch_size}")
@@ -404,7 +405,9 @@ def main():
                 envs.close()
                 env_fns = [make_env(args.seed + i, difficulty=current_difficulty) for i in range(args.num_envs)]
                 envs = SyncVectorEnv(env_fns)
-                print(f"Curriculum learning: Increasing difficulty to {current_difficulty:.1f}")
+                print(f"Curriculum learning: Increasing difficulty to {current_difficulty}")
+                # Update threshold for next difficulty increase
+                curriculum_threshold += 5.0  # Make it harder to reach next level
             
             # Save intermediate checkpoint
             if updates % (args.eval_interval * 10) == 0:
