@@ -502,12 +502,12 @@ def main():
                 best_return = ep_ret
                 best_epoch = ep
                 torch.save(net.state_dict(), os.path.splitext(args.dataset)[0] + "_best_ppo.pt")
-                if args.use_awbc:
+                if args.algorithm == 'awbc':
                     print(f"Epoch {ep:03d}/{args.epochs} | eval return {ep_ret:5.1f} | loss {mean_loss:.4f} | NEW BEST!")
                 else:
                     print(f"Epoch {ep:03d}/{args.epochs} | eval return {ep_ret:5.1f} | NEW BEST!")
             else:
-                if args.use_awbc:
+                if args.algorithm == 'awbc':
                     print(f"Epoch {ep:03d}/{args.epochs} | eval return {ep_ret:5.1f} | loss {mean_loss:.4f} | Best: {best_return:.1f} (ep {best_epoch})")
                 else:
                     print(f"Epoch {ep:03d}/{args.epochs} | eval return {ep_ret:5.1f} | Best: {best_return:.1f} (ep {best_epoch})")
