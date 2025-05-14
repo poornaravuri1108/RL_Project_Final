@@ -103,19 +103,6 @@ def behaviour_cloning(net, opt, obs, act, bs, epochs, device):
         print(f"[BC] epoch {ep}/{epochs} | loss {tot/len(obs):.4f}")
 
 
-# Random crop data augmentation for observations
-def random_crop(x, padding=4):
-    """Apply random crop data augmentation to batch of observations."""
-    b, c, h, w = x.shape
-    padded = F.pad(x, (padding, padding, padding, padding), mode='constant', value=0)
-    crops = []
-    for i in range(b):
-        top = np.random.randint(0, padding * 2)
-        left = np.random.randint(0, padding * 2)
-        crops.append(padded[i:i+1, :, top:top+h, left:left+w])
-    return torch.cat(crops, dim=0)
-
-
 # ──────────── Advantage-Weighted Behavior Cloning Update ────────────
 def awbc_update(net, opt, obs, act, ret, adv, 
                 beta=0.05, grad_clip=0.5, device="cuda"):
@@ -288,6 +275,10 @@ def main():
                     help='Temperature for advantage weighting in weighted BC-PPO')
     pa.add_argument('--awbc_batches', type=int, default=100,
                     help='Number of updates per epoch for AWBC')
+    pa.add_argument('--awbc_beta', type=float, default=0.05,
+                    help='Temperature parameter for advantage weighting')
+    pa.add_argument('--ppo_gd', type=int, default=4,
+                    help='Number of PPO gradient steps per epoch')
     pa.add_argument('--clip', type=float, default=0.1)  # Reduced clip parameter for more conservative updates
     pa.add_argument('--vf_coef', type=float, default=0.5)
     pa.add_argument('--ent_coef', type=float, default=0.001)  # Further reduced entropy for offline learning
@@ -343,7 +334,7 @@ def main():
         best_epoch = 0
         
         # Pre-compute advantage estimates for AWBC if needed
-        if args.use_awbc:
+        if args.algorithm == 'awbc':
             print("Computing advantage estimates for dataset...")
             net.eval()
             with torch.no_grad():
