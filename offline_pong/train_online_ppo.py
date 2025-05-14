@@ -85,7 +85,7 @@ def compute_gae(rewards, values, dones, next_values, gamma=0.99, lam=0.95):
 
 # PPO update - the standard online version
 def ppo_update(model, optimizer, states, actions, old_log_probs, returns, advantages,
-               clip_ratio=0.2, vf_coef=0.5, ent_coef=0.01, max_grad_norm=0.5,
+               clip_ratio=0.1, vf_coef=0.5, ent_coef=0.01, max_grad_norm=0.5,
                update_epochs=4, batch_size=64, device='cuda'):
     """Standard PPO update"""
     # Convert numpy arrays to PyTorch tensors
@@ -134,12 +134,50 @@ def ppo_update(model, optimizer, states, actions, old_log_probs, returns, advant
             optimizer.step()
 
 
-def make_env(seed=0):
-    """Create a preprocessed Pong environment"""
+class PongRewardShaping(gym.Wrapper):
+    """Wrapper that adds shaped rewards to help learning in Pong"""
+    def __init__(self, env):
+        super().__init__(env)
+        self.prev_obs = None
+        self.ball_position = None
+        self.paddle_position = None
+    
+    def reset(self, **kwargs):
+        obs, info = self.env.reset(**kwargs)
+        self.prev_obs = obs
+        # Initialize ball and paddle positions based on observation
+        self.ball_position = None
+        self.paddle_position = None
+        return obs, info
+    
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        
+        # Enhanced reward: original reward + shaping reward
+        shaped_reward = reward
+        
+        # Add small reward for surviving (encourages keeping ball in play)
+        if not terminated and reward == 0:
+            shaped_reward += 0.01
+        
+        # Give a strong positive reward for winning a point
+        if reward > 0:
+            shaped_reward = 2.0  # Emphasize winning points
+            
+        # Store current observation for next step
+        self.prev_obs = obs
+        
+        return obs, shaped_reward, terminated, truncated, info
+
+
+def make_env(seed=0, difficulty=0.0):
+    """Create a preprocessed Pong environment with curriculum learning"""
     def _init():
-        env = gym.make("ALE/Pong-v5", frameskip=1, full_action_space=False)
+        # The difficulty parameter controls opponent skill (0.0=easy, 1.0=hard)
+        env = gym.make("ALE/Pong-v5", frameskip=1, full_action_space=False, difficulty=difficulty)
         env = AtariPreprocessing(env, grayscale_obs=True, scale_obs=False, frame_skip=4)
         env = FrameStack(env, 4)
+        env = PongRewardShaping(env)  # Apply reward shaping
         env.seed(seed)
         return env
     return _init
@@ -222,9 +260,11 @@ def collect_rollout(envs, model, rollout_steps, device):
 
 def evaluate_policy(model, n_episodes=10, device='cuda'):
     """Evaluate the policy on the environment"""
-    env = gym.make("ALE/Pong-v5", frameskip=1, full_action_space=False)
+    # Evaluate on max difficulty (1.0) to get a true measure of performance
+    env = gym.make("ALE/Pong-v5", frameskip=1, full_action_space=False, difficulty=1.0)
     env = AtariPreprocessing(env, grayscale_obs=True, scale_obs=False, frame_skip=4)
     env = FrameStack(env, 4)
+    # Note: We don't use reward shaping during evaluation to get true performance
     
     returns = []
     for _ in range(n_episodes):
@@ -254,14 +294,14 @@ def evaluate_policy(model, n_episodes=10, device='cuda'):
 def main():
     # Parse arguments
     parser = argparse.ArgumentParser()
-    parser.add_argument('--steps', type=int, default=1000000, help='Total steps to train')
-    parser.add_argument('--num_envs', type=int, default=8, help='Number of environments to run in parallel')
+    parser.add_argument('--steps', type=int, default=2000000, help='Total steps to train')
+    parser.add_argument('--num_envs', type=int, default=16, help='Number of environments to run in parallel')
     parser.add_argument('--rollout_steps', type=int, default=128, help='Steps per rollout per environment')
-    parser.add_argument('--batch_size', type=int, default=256, help='Minibatch size')
-    parser.add_argument('--lr', type=float, default=2.5e-4, help='Learning rate')
+    parser.add_argument('--batch_size', type=int, default=512, help='Minibatch size')
+    parser.add_argument('--lr', type=float, default=3e-4, help='Learning rate')
     parser.add_argument('--clip_ratio', type=float, default=0.1, help='PPO clip ratio')
     parser.add_argument('--vf_coef', type=float, default=0.5, help='Value function coefficient')
-    parser.add_argument('--ent_coef', type=float, default=0.01, help='Entropy coefficient')
+    parser.add_argument('--ent_coef', type=float, default=0.02, help='Entropy coefficient - increased for better exploration')
     parser.add_argument('--update_epochs', type=int, default=4, help='Number of PPO epochs per update')
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
     parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu', help='Device (cuda/cpu)')
@@ -272,14 +312,18 @@ def main():
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     
-    # Create vectorized environments
-    env_fns = [make_env(args.seed + i) for i in range(args.num_envs)]
+    # Create vectorized environments with curriculum learning
+    # Start with easier difficulty to help the agent learn fundamentals
+    initial_difficulty = 0.0
+    env_fns = [make_env(args.seed + i, difficulty=initial_difficulty) for i in range(args.num_envs)]
     envs = SyncVectorEnv(env_fns)
     
     # Create model
     device = torch.device(args.device)
     model = ActorCritic(4, 6).to(device)  # 4 frames, 6 actions
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    
+    # Use a more sophisticated optimizer with warm-up and weight decay
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
     
     # Setup logging
     log_path = "online_ppo_pong_training_log.csv"
@@ -295,6 +339,12 @@ def main():
     total_steps = 0
     best_eval_return = -21.0  # Lowest possible Pong score
     updates = 0
+    
+    # Curriculum learning variables
+    curriculum_threshold = -15.0  # When to increase difficulty
+    current_difficulty = initial_difficulty
+    max_difficulty = 1.0
+    difficulty_step = 0.2  # How much to increase difficulty
     
     print(f"Starting training for {args.steps} steps with {args.num_envs} environments")
     print(f"Device: {args.device}, Batch size: {args.batch_size}")
@@ -346,6 +396,15 @@ def main():
                 print(f"Update {updates} | Steps {total_steps} | Return {eval_return:.1f} | NEW BEST!")
             else:
                 print(f"Update {updates} | Steps {total_steps} | Return {eval_return:.1f} | Best: {best_eval_return:.1f}")
+            
+            # Apply curriculum learning: increase difficulty if performance is good
+            if best_eval_return >= curriculum_threshold and current_difficulty < max_difficulty:
+                current_difficulty = min(current_difficulty + difficulty_step, max_difficulty)
+                # Create new vectorized environments with updated difficulty
+                envs.close()
+                env_fns = [make_env(args.seed + i, difficulty=current_difficulty) for i in range(args.num_envs)]
+                envs = SyncVectorEnv(env_fns)
+                print(f"Curriculum learning: Increasing difficulty to {current_difficulty:.1f}")
             
             # Save intermediate checkpoint
             if updates % (args.eval_interval * 10) == 0:
