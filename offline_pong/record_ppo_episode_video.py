@@ -14,11 +14,9 @@ os.makedirs(VIDEO_DIR, exist_ok=True)
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    # Create environment with video recording
     env = gym.make("ALE/Pong-v5", render_mode="rgb_array", frameskip=1)
     env = gym.wrappers.RecordVideo(env, video_folder=VIDEO_DIR, episode_trigger=lambda x: True)
     
-    # Apply the same preprocessing as during training
     env = AtariPreprocessing(
         env, 
         frame_skip=4,
@@ -29,9 +27,7 @@ def main():
     )
     env = FrameStack(env, 4)
     
-    # Load model - use the first dimension of the observation space as input channels
-    # For FrameStack with 4 frames, this will be 4
-    input_channels = 4  # For stacked frames
+    input_channels = 4  
     model = ActorCritic(input_channels, env.action_space.n).to(device)
     model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
     model.eval()
@@ -41,7 +37,6 @@ def main():
     total_reward = 0
     
     while not done:
-        # Convert LazyFrames to numpy array to tensor
         obs_np = np.array(obs)
         obs_tensor = torch.tensor(obs_np, dtype=torch.float32, device=device).unsqueeze(0)
         

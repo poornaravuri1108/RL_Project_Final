@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Plot training results from CSV log files for DQN and PPO agents.
 """
@@ -8,13 +7,11 @@ import pandas as pd
 import os
 
 def plot_training_results():
-    # Define the CSV files and their column names
     dqn_file = "dqn_logs.csv"
     ppo_file = "pong_offline_training_log.csv"
     
     plt.figure(figsize=(12, 6))
     
-    # Plot DQN results if available
     if os.path.exists(dqn_file):
         try:
             dqn_data = pd.read_csv(dqn_file)
@@ -28,7 +25,6 @@ def plot_training_results():
     else:
         print(f"DQN file '{dqn_file}' not found")
     
-    # Plot PPO results if available
     if os.path.exists(ppo_file):
         try:
             ppo_data = pd.read_csv(ppo_file)
@@ -42,14 +38,12 @@ def plot_training_results():
     else:
         print(f"PPO file '{ppo_file}' not found")
     
-    # Add labels and legend
     plt.xlabel('Training Steps/Epochs')
     plt.ylabel('Average Reward')
     plt.title('Reinforcement Learning Performance on Pong')
     plt.grid(True, alpha=0.3)
     plt.legend()
     
-    # Save and show the plot
     plt.tight_layout()
     plt.savefig('training_results.png', dpi=300)
     print("Plot saved as 'training_results.png'")

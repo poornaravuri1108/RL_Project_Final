@@ -1,17 +1,3 @@
-#!/usr/bin/env python3
-"""
-Online PPO for Atari Pong (minimal action-set)
-
-Key features:
-✓ Standard PPO with GAE for advantage estimation
-✓ Online data collection and learning
-✓ Vectorized environments for faster data collection
-✓ Properly tuned hyperparameters for Pong
-✓ CSV logging and model checkpointing
-
-This implementation follows the standard PPO algorithm with online interactions,
-which is what PPO was originally designed for and where it performs best.
-"""
 import argparse
 import csv
 import os
@@ -53,15 +39,13 @@ class ActorCritic(nn.Module):
 
 
 def to_tensor(obs_np, device):
-    """Convert numpy observations to PyTorch tensors"""
-    if obs_np.shape[-1] in (1, 4):  # NHWC format
+    if obs_np.shape[-1] in (1, 4):  
         obs_np = np.transpose(obs_np, (0, 3, 1, 2))
     return torch.from_numpy(obs_np).to(device)
 
 
 # GAE calculation
 def compute_gae(rewards, values, dones, next_values, gamma=0.99, lam=0.95):
-    """Compute Generalized Advantage Estimation"""
     advantages = np.zeros_like(rewards, dtype=np.float32)
     last_gae = 0
     
@@ -71,51 +55,40 @@ def compute_gae(rewards, values, dones, next_values, gamma=0.99, lam=0.95):
         else:
             next_value = values[t + 1]
         
-        # Delta = r + gamma * V(s') * (1 - done) - V(s)
         delta = rewards[t] + gamma * next_value * (1 - dones[t]) - values[t]
         
-        # GAE = delta + gamma * lambda * (1 - done) * last_gae
         advantages[t] = last_gae = delta + gamma * lam * (1 - dones[t]) * last_gae
     
-    # Returns = advantages + values
     returns = advantages + values
     
     return returns, advantages
 
 
-# PPO update - the standard online version
+# PPO update
 def ppo_update(model, optimizer, states, actions, old_log_probs, returns, advantages,
                clip_ratio=0.1, vf_coef=0.5, ent_coef=0.01, max_grad_norm=0.5,
                update_epochs=4, batch_size=64, device='cuda'):
-    """Standard PPO update"""
-    # Convert numpy arrays to PyTorch tensors
     states = torch.FloatTensor(states).to(device)
     actions = torch.LongTensor(actions).to(device)
     old_log_probs = torch.FloatTensor(old_log_probs).to(device)
     returns = torch.FloatTensor(returns).to(device)
     advantages = torch.FloatTensor(advantages).to(device)
     
-    # Normalize advantages
     advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
     
-    # Create dataset and loader
     dataset = TensorDataset(states, actions, old_log_probs, returns, advantages)
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
     
-    # Multiple epochs of PPO updates
     for _ in range(update_epochs):
         for batch in loader:
             b_states, b_actions, b_old_log_probs, b_returns, b_advantages = batch
             
-            # Get current policy and value predictions
             logits, values = model(b_states)
             
-            # Calculate log probabilities and entropy
             dist = torch.distributions.Categorical(logits=logits)
             new_log_probs = dist.log_prob(b_actions)
             entropy = dist.entropy().mean()
             
-            # Compute ratio and clipped objective
             ratio = torch.exp(new_log_probs - b_old_log_probs)
             clip_adv = torch.clamp(ratio, 1.0 - clip_ratio, 1.0 + clip_ratio) * b_advantages
             policy_loss = -torch.min(ratio * b_advantages, clip_adv).mean()
@@ -135,7 +108,6 @@ def ppo_update(model, optimizer, states, actions, old_log_probs, returns, advant
 
 
 class PongRewardShaping(gym.Wrapper):
-    """Wrapper that adds shaped rewards to help learning in Pong"""
     def __init__(self, env):
         super().__init__(env)
         self.prev_obs = None
@@ -145,7 +117,6 @@ class PongRewardShaping(gym.Wrapper):
     def reset(self, **kwargs):
         obs, info = self.env.reset(**kwargs)
         self.prev_obs = obs
-        # Initialize ball and paddle positions based on observation
         self.ball_position = None
         self.paddle_position = None
         return obs, info
@@ -153,32 +124,25 @@ class PongRewardShaping(gym.Wrapper):
     def step(self, action):
         obs, reward, terminated, truncated, info = self.env.step(action)
         
-        # Enhanced reward: original reward + shaping reward
         shaped_reward = reward
         
-        # Add small reward for surviving (encourages keeping ball in play)
         if not terminated and reward == 0:
             shaped_reward += 0.01
         
-        # Give a strong positive reward for winning a point
         if reward > 0:
-            shaped_reward = 2.0  # Emphasize winning points
+            shaped_reward = 2.0  
             
-        # Store current observation for next step
         self.prev_obs = obs
         
         return obs, shaped_reward, terminated, truncated, info
 
 
 def make_env(seed=0, difficulty=0):
-    """Create a preprocessed Pong environment with curriculum learning"""
     def _init():
-        # The difficulty parameter controls opponent skill (0=easy, 3=hard)
-        # Pong difficulty levels are integers (0,1,2,3)
         env = gym.make("ALE/Pong-v5", frameskip=1, full_action_space=False, difficulty=difficulty)
         env = AtariPreprocessing(env, grayscale_obs=True, scale_obs=False, frame_skip=4)
         env = FrameStack(env, 4)
-        env = PongRewardShaping(env)  # Apply reward shaping
+        env = PongRewardShaping(env)  
         env.seed(seed)
         return env
     return _init
@@ -188,7 +152,6 @@ def collect_rollout(envs, model, rollout_steps, device):
     """Collect a batch of rollout data from vectorized environments"""
     num_envs = envs.num_envs
     
-    # Initialize storage
     states = np.zeros((rollout_steps, num_envs, 4, 84, 84), dtype=np.uint8)
     actions = np.zeros((rollout_steps, num_envs), dtype=np.int64)
     rewards = np.zeros((rollout_steps, num_envs), dtype=np.float32)
@@ -196,12 +159,9 @@ def collect_rollout(envs, model, rollout_steps, device):
     values = np.zeros((rollout_steps, num_envs), dtype=np.float32)
     log_probs = np.zeros((rollout_steps, num_envs), dtype=np.float32)
     
-    # Reset environments
     obs, _ = envs.reset()
     
-    # Collect rollout
     for t in range(rollout_steps):
-        # Convert observations and get action from policy
         obs_tensor = to_tensor(obs, device)
         
         with torch.no_grad():
@@ -225,13 +185,11 @@ def collect_rollout(envs, model, rollout_steps, device):
         # Update observation
         obs = next_obs
     
-    # Get final value for bootstrapping
     with torch.no_grad():
         obs_tensor = to_tensor(obs, device)
         _, next_value = model(obs_tensor)
         next_value = next_value.cpu().numpy()
     
-    # Reshape to (timesteps * num_envs, ...)
     flat_size = rollout_steps * num_envs
     states = states.reshape(flat_size, 4, 84, 84)
     actions = actions.reshape(flat_size)
@@ -240,7 +198,6 @@ def collect_rollout(envs, model, rollout_steps, device):
     values = values.reshape(flat_size)
     log_probs = log_probs.reshape(flat_size)
     
-    # Compute returns and advantages
     returns, advantages = compute_gae(
         rewards, values, dones, 
         np.append(values[1:], next_value),
@@ -260,12 +217,9 @@ def collect_rollout(envs, model, rollout_steps, device):
 
 
 def evaluate_policy(model, n_episodes=10, device='cuda'):
-    """Evaluate the policy on the environment"""
-    # Evaluate on standard difficulty (1) to get a measure of performance
     env = gym.make("ALE/Pong-v5", frameskip=1, full_action_space=False, difficulty=1)
     env = AtariPreprocessing(env, grayscale_obs=True, scale_obs=False, frame_skip=4)
     env = FrameStack(env, 4)
-    # Note: We don't use reward shaping during evaluation to get true performance
     
     returns = []
     for _ in range(n_episodes):
@@ -274,14 +228,12 @@ def evaluate_policy(model, n_episodes=10, device='cuda'):
         episode_return = 0
         
         while not done:
-            # Convert observation and get action from policy
             obs_tensor = to_tensor(np.expand_dims(obs, 0), device)
             
             with torch.no_grad():
                 logits, _ = model(obs_tensor)
                 action = torch.argmax(logits, dim=1).item()
             
-            # Step environment
             obs, reward, term, trunc, _ = env.step(action)
             done = term or trunc
             episode_return += reward
@@ -293,7 +245,6 @@ def evaluate_policy(model, n_episodes=10, device='cuda'):
 
 
 def main():
-    # Parse arguments
     parser = argparse.ArgumentParser()
     parser.add_argument('--steps', type=int, default=2000000, help='Total steps to train')
     parser.add_argument('--num_envs', type=int, default=16, help='Number of environments to run in parallel')
@@ -309,43 +260,34 @@ def main():
     parser.add_argument('--eval_interval', type=int, default=10, help='Evaluate every N updates')
     args = parser.parse_args()
     
-    # Set random seeds
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     
-    # Create vectorized environments with curriculum learning
-    # Start with easiest difficulty (0) to help the agent learn fundamentals
-    initial_difficulty = 0  # Integer difficulty level
+    initial_difficulty = 0  
     env_fns = [make_env(args.seed + i, difficulty=initial_difficulty) for i in range(args.num_envs)]
     envs = SyncVectorEnv(env_fns)
     
-    # Create model
     device = torch.device(args.device)
-    model = ActorCritic(4, 6).to(device)  # 4 frames, 6 actions
+    model = ActorCritic(4, 6).to(device)  
     
-    # Use a more sophisticated optimizer with warm-up and weight decay
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
     
-    # Setup logging
     log_path = "online_ppo_pong_training_log.csv"
     with open(log_path, 'w', newline='') as f:
         writer = csv.writer(f)
         writer.writerow(['update', 'total_steps', 'mean_reward', 'eval_return'])
     
-    # Save initial model
     os.makedirs("models", exist_ok=True)
     torch.save(model.state_dict(), "models/online_ppo_pong_init.pt")
     
-    # Training loop
     total_steps = 0
-    best_eval_return = -21.0  # Lowest possible Pong score
+    best_eval_return = -21.0  
     updates = 0
     
-    # Curriculum learning variables
-    curriculum_threshold = -15.0  # When to increase difficulty
+    curriculum_threshold = -15.0  
     current_difficulty = initial_difficulty
-    max_difficulty = 3  # Pong has difficulty levels 0,1,2,3
-    difficulty_step = 1  # Increase by 1 level at a time
+    max_difficulty = 3  
+    difficulty_step = 1  
     
     print(f"Starting training for {args.steps} steps with {args.num_envs} environments")
     print(f"Device: {args.device}, Batch size: {args.batch_size}")
@@ -353,10 +295,8 @@ def main():
     start_time = time.time()
     
     while total_steps < args.steps:
-        # Collect rollout
         rollout_data = collect_rollout(envs, model, args.rollout_steps, device)
         
-        # Update policy
         ppo_update(
             model=model,
             optimizer=optimizer,

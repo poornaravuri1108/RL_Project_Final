@@ -6,14 +6,12 @@ from gymnasium.wrappers import AtariPreprocessing, FrameStack
 
 from train_dqn import DQNNetwork
 
-MODEL_PATH = "../dqn_pong.pt"  # DQN weights in project root
+MODEL_PATH = "../dqn_pong.pt" 
 VIDEO_DIR = "videos/"
 
 os.makedirs(VIDEO_DIR, exist_ok=True)
 
 def select_action(model, obs, device):
-    # For FrameStack wrapper, obs is LazyFrames object
-    # Convert to numpy array and then to tensor
     obs_np = np.array(obs)
     obs_tensor = torch.tensor(obs_np, dtype=torch.float32, device=device).unsqueeze(0)
     with torch.no_grad():
@@ -24,11 +22,9 @@ def select_action(model, obs, device):
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    # First create a regular env for video recording with frameskip=1 (disable built-in frame skipping)
     env = gym.make("ALE/Pong-v5", render_mode="rgb_array", frameskip=1)
     env = gym.wrappers.RecordVideo(env, video_folder=VIDEO_DIR, episode_trigger=lambda x: True)
     
-    # Apply the same preprocessing as during training
     env = AtariPreprocessing(
         env, 
         frame_skip=4,
@@ -39,12 +35,10 @@ def main():
     )
     env = FrameStack(env, 4)
     
-    # Load model
     model = DQNNetwork(4, env.action_space.n).to(device)
     model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
     model.eval()
     
-    # Run one episode
     obs, _ = env.reset()
     done = False
     total_reward = 0
