@@ -45,14 +45,12 @@ def main(transitions: int, out_path: str, device: str):
     model = load_pretrained_dqn(device)
     torch.set_num_threads(os.cpu_count() or 1)
 
-    # Build a 1-env Atari Pong vectorized environment with 4-frame stacking
     # Observation shape: (1, 4, 84, 84)
     env = make_atari_env("PongNoFrameskip-v4", n_envs=1, seed=0)
     env = VecFrameStack(env, n_stack=4)
 
     # Prepare HDF5 file for streaming writes
     with h5py.File(out_path, "w") as f:
-        # Reset env to get obs shape and dtype
         obs = env.reset()  # shape (1, 4, 84, 84), dtype uint8
         obs_dtype = obs.dtype
         n_envs, C, H, W = obs.shape
@@ -68,21 +66,16 @@ def main(transitions: int, out_path: str, device: str):
         count = 0
 
         while count < transitions:
-            # Mix deterministic and stochastic actions to increase dataset diversity
-            if np.random.random() < 0.3:  # 30% chance of random exploration
+            if np.random.random() < 0.3:
                 a = int(np.random.randint(0, env.action_space.n))
             else:
-                # Use pretrained policy with some randomness
-                deterministic = np.random.random() < 0.7  # 70% deterministic, 30% stochastic
+                deterministic = np.random.random() < 0.7 
                 action, _ = model.predict(obs, deterministic=deterministic)
-                a = int(action)  # ensure Python int
+                a = int(action)  
 
-            # Step environment (expects list of actions for each env)
             obs_next, reward, done, infos = env.step([a])
-            # obs_next: shape (1,4,84,84), dtype uint8
 
-            # Write transition to HDF5
-            obs_dset[count]       = obs[0]        # drop batch dim
+            obs_dset[count]       = obs[0]        
             actions_dset[count]   = a
             rewards_dset[count]   = float(reward[0])
             terminals_dset[count] = bool(done[0])
@@ -90,7 +83,6 @@ def main(transitions: int, out_path: str, device: str):
             count += 1
             pbar.update(1)
 
-            # Advance or reset
             if done[0]:
                 obs = env.reset()
             else:
